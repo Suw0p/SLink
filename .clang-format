@@ -1,0 +1,50 @@
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++20
+
+IndentWidth: 4
+ContinuationIndentWidth: 4
+ConstructorInitializerIndentWidth: 4
+TabWidth: 4
+UseTab: Never
+AccessModifierOffset: -4
+NamespaceIndentation: None
+IndentCaseLabels: false
+IndentCaseBlocks: false
+IndentPPDirectives: None
+
+ColumnLimit: 100
+BreakBeforeBraces: Attach
+BreakBeforeBinaryOperators: None
+BreakConstructorInitializers: BeforeColon
+BinPackArguments: false
+BinPackParameters: false
+AllowAllArgumentsOnNextLine: true
+AllowAllParametersOfDeclarationOnNextLine: true
+AllowShortBlocksOnASingleLine: Empty
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortEnumsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLambdasOnASingleLine: Empty
+AllowShortLoopsOnASingleLine: false
+
+DerivePointerAlignment: false
+PointerAlignment: Left
+ReferenceAlignment: Left
+SortIncludes: CaseSensitive
+# Preserve intentional include blocks. Windows SDK extension headers such as
+# commctrl.h, shellapi.h and netfw.h require the base Windows declarations, so
+# windows.h must remain first inside a system-header block.
+IncludeBlocks: Preserve
+IncludeCategories:
+  - Regex: '^<[Ww]indows\.h>$'
+    Priority: 0
+    SortPriority: 0
+  - Regex: '.*'
+    Priority: 1
+    SortPriority: 1
+FixNamespaceComments: true
+ReflowComments: true
+SpacesInAngles: Never
+SpaceBeforeParens: ControlStatements

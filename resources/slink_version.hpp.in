@@ -1,0 +1,13 @@
+#pragma once
+
+// UI、版本资源和 manifest 均由 CMake 的 project(VERSION) 生成，避免手工维护多处。
+namespace SLink::version {
+
+inline constexpr wchar_t kString[] = L"@PROJECT_VERSION@";
+inline constexpr wchar_t kDisplay[] = L"V@PROJECT_VERSION@";
+inline constexpr char kWindowsVersion[] = "@SLINK_WINDOWS_VERSION@";
+inline constexpr unsigned kMajor = @PROJECT_VERSION_MAJOR@;
+inline constexpr unsigned kMinor = @PROJECT_VERSION_MINOR@;
+inline constexpr unsigned kPatch = @PROJECT_VERSION_PATCH@;
+
+} // namespace SLink::version
