@@ -172,5 +172,3 @@ Windows 文件属性中的版本与设置页右上角的 `V1.1.1` 均来自 CMak
 Lexilla。libvterm 0.3.3 由项目内源码构建，其余预编译依赖随项目提供。
 完整许可文本位于 `3rd/include/LICENSES`，汇总见
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
-
-公开发布前请根据项目授权方案在仓库根目录添加项目自身的 `LICENSE`。
