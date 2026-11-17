@@ -1642,13 +1642,20 @@ struct EditorPage::Impl {
         if (index < 0) {
             return false;
         }
-        if (active_id && *active_id == id) {
+        const bool closing_active = active_id && *active_id == id;
+        if (closing_active) {
             SyncActiveContent();
         }
         documents.erase(documents.begin() + index);
         if (documents.empty()) {
             active_id.reset();
             LoadActiveDocument();
+            return true;
+        }
+        if (!closing_active && active_id && FindDocument(*active_id)) {
+            // 非活动标签的关闭只改变标签栏。当前文本由 Scintilla 持有，
+            // DocumentState::content 此时为空；重新加载会把可见文件清空。
+            UpdateConflictBar();
             return true;
         }
         const int next_index = (std::min)(index, static_cast<int>(documents.size()) - 1);
