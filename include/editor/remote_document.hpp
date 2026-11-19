@@ -175,6 +175,8 @@ public:
 
     // 干净文档关闭时删除缓存和元数据；未保存文档保留用于崩溃恢复。析构行为相同。
     EditorStatus Close();
+    // 用户明确放弃本地修改时清理恢复缓存，不向远端写入任何内容。
+    EditorStatus DiscardChanges();
 
 private:
     friend class RemoteEditorService;

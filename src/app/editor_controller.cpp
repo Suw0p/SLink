@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -228,6 +229,7 @@ struct EditorController::Impl {
     ui::EditorDocumentId next_document_id{1};
     std::unordered_map<ui::EditorDocumentId, std::shared_ptr<DocumentState>> documents;
     std::unordered_map<std::string, ui::EditorDocumentId> uri_index;
+    std::unordered_set<std::string> reopening_uris;
 
     Impl(ui::EditorPage& editor_page, const storage::AppPaths& paths, EndpointResolver resolver)
         : page(editor_page), service(paths), endpoint_resolver(std::move(resolver)) {
@@ -489,16 +491,68 @@ struct EditorController::Impl {
         return result;
     }
 
-    void Open(transfer::FileUri uri) {
+    void Open(transfer::FileUri uri, bool reopen_existing = false) {
         if (GetCurrentThreadId() != ui_thread_id) {
-            PostToUi([this, uri = std::move(uri)]() mutable {
-                Open(std::move(uri));
+            PostToUi([this, uri = std::move(uri), reopen_existing]() mutable {
+                Open(std::move(uri), reopen_existing);
             });
             return;
         }
         const auto key = uri.to_string();
+        if (reopening_uris.contains(key)) {
+            return;
+        }
         if (const auto found = uri_index.find(key); found != uri_index.end()) {
-            page.ActivateDocument(found->second);
+            const auto id = found->second;
+            // 尚在首次加载时不重复排队；已显示的文件再次从列表打开才重新读取。
+            if (!page.ActivateDocument(id) || !reopen_existing) {
+                return;
+            }
+            const auto state = documents.find(id);
+            if (state == documents.end()) {
+                return;
+            }
+            if (page.DocumentSaving(id)) {
+                ReportError(L"重新打开文件", L"文件正在保存，请等待保存结束后再重新打开。");
+                return;
+            }
+            const bool discard_local_changes =
+                state->second->ui_dirty.load(std::memory_order_acquire);
+            if (discard_local_changes &&
+                MessageBoxW(page.hwnd(),
+                            L"此文件有未保存的本地修改。重新读取远端文件会丢弃这些修改，"
+                            L"且不会上传或覆盖远端文件。\r\n\r\n确定丢弃本地修改并重新打开吗？",
+                            L"重新打开文件",
+                            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                return;
+            }
+            auto previous = state->second;
+            previous->closing.store(true, std::memory_order_release);
+            previous->edit_generation.fetch_add(1, std::memory_order_acq_rel);
+            uri_index.erase(found);
+            documents.erase(state);
+            page.CloseDocument(id);
+            reopening_uris.insert(key);
+            Enqueue(previous->lane,
+                    [this, previous, uri = std::move(uri), key, discard_local_changes]() mutable {
+                        editor::EditorStatus closed;
+                        {
+                            std::scoped_lock lock(previous->mutex);
+                            if (previous->document) {
+                                closed = discard_local_changes
+                                             ? previous->document->DiscardChanges()
+                                             : previous->document->Close();
+                            }
+                        }
+                        PostToUi([this, uri = std::move(uri), key, closed]() mutable {
+                            reopening_uris.erase(key);
+                            if (!closed) {
+                                ReportError(L"重新打开文件", Utf8ToWide(closed.message));
+                                return;
+                            }
+                            Open(std::move(uri));
+                        });
+                    });
             return;
         }
 
@@ -666,7 +720,7 @@ struct EditorController::Impl {
                 uri = transfer::FileUri::sftp(activation.server_id, directory).joined(name);
             }
             if (uri) {
-                Open(std::move(*uri));
+                Open(std::move(*uri), true);
             }
         } catch (const std::exception& error) {
             ReportError(L"打开远程文件", Utf8ToWide(error.what()));

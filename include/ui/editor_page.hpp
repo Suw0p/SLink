@@ -145,6 +145,7 @@ public:
     void ClearDocumentConflict(EditorDocumentId id);
 
     [[nodiscard]] std::optional<std::string> DocumentText(EditorDocumentId id);
+    [[nodiscard]] bool DocumentSaving(EditorDocumentId id) const noexcept;
     [[nodiscard]] std::optional<EditorDocumentId> active_document() const noexcept;
     [[nodiscard]] std::size_t document_count() const noexcept;
 

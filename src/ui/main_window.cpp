@@ -35,6 +35,7 @@ constexpr int kDarkThemeId = 1202;
 constexpr int kLightThemeId = 1203;
 constexpr int kSharedServerSearchId = 1204;
 constexpr int kSharedServerListId = 1205;
+constexpr int kServerUngroupedId = 1206;
 // 分组 ID 只允许字母、数字和 -_.；该保留值可安全表示未分组标题的折叠状态。
 constexpr std::string_view kUngroupedCollapseKey = "@ungrouped";
 constexpr int kMinimizeWindowId = 1210;
@@ -128,6 +129,8 @@ struct MainWindow::Impl {
     std::vector<VisibleServerRow> visible_server_rows;
     std::unordered_set<std::string> collapsed_server_groups;
     std::function<bool(const std::vector<std::string>&)> collapsed_groups_changed;
+    std::function<bool(bool)> server_ungrouped_changed;
+    bool server_ungrouped{};
     std::string selected_server_id;
     std::size_t visible_server_count{};
     bool rebuilding_server_list{};
@@ -602,9 +605,30 @@ struct MainWindow::Impl {
                 }
             }
         };
-        append_group({}, L"未分组");
-        for (const auto& group : server_groups) {
-            append_group(group.id, group.label);
+        if (server_ungrouped) {
+            for (std::size_t index = 0; index < server_items.size(); ++index) {
+                if (!contains_query(server_items[index].label)) {
+                    continue;
+                }
+                std::wstring text = server_items[index].label;
+                TVINSERTSTRUCTW insert{};
+                insert.hParent = TVI_ROOT;
+                insert.hInsertAfter = TVI_LAST;
+                insert.item.mask = TVIF_TEXT | TVIF_PARAM;
+                insert.item.pszText = text.data();
+                insert.item.lParam = static_cast<LPARAM>(index + 1);
+                const HTREEITEM inserted = TreeView_InsertItem(server_list, &insert);
+                visible_server_rows.push_back({index, {}});
+                ++visible_server_count;
+                if (server_items[index].id == selected_server_id) {
+                    selected_item = inserted;
+                }
+            }
+        } else {
+            append_group({}, L"未分组");
+            for (const auto& group : server_groups) {
+                append_group(group.id, group.label);
+            }
         }
         TreeView_SelectItem(server_list, selected_item);
         if (preserve_scroll) {
@@ -628,7 +652,7 @@ struct MainWindow::Impl {
         selected_server_id.assign(server_id);
         const std::size_t target =
             static_cast<std::size_t>(std::distance(server_items.begin(), found));
-        if (server_search && GetWindowTextLengthW(server_search) == 0) {
+        if (!server_ungrouped && server_search && GetWindowTextLengthW(server_search) == 0) {
             const std::string group = found->group_id.value_or(std::string{});
             if (collapsed_server_groups.erase(group) != 0) {
                 if (NotifyCollapsedGroupsChanged()) {
@@ -911,6 +935,16 @@ struct MainWindow::Impl {
             }
             selected_theme = next;
             ApplyThemeNow(next);
+            return;
+        }
+        if (id == kServerUngroupedId) {
+            const bool next = !server_ungrouped;
+            if (server_ungrouped_changed && !server_ungrouped_changed(next)) {
+                return;
+            }
+            server_ungrouped = next;
+            PopulateServerList(true);
+            CommitLayoutNow();
             return;
         }
     }
@@ -1247,7 +1281,7 @@ struct MainWindow::Impl {
 
         const float content_top = static_cast<float>(nav_height);
         const float card_width = std::min(680.0F * scale, static_cast<float>(width) - 64.0F);
-        const float card_height = 340.0F * scale;
+        const float card_height = 386.0F * scale;
         const float card_left = (static_cast<float>(width) - card_width) / 2.0F;
         const float card_top =
             content_top +
@@ -1348,21 +1382,39 @@ struct MainWindow::Impl {
             .alignment = detail::UiTextAlign::leading,
         });
         surface.Add({
-            .role = detail::UiRole::muted,
+            .role = detail::UiRole::label,
             .bounds = detail::UiRect(card_left + 30.0F * scale,
                                      card_top + 266.0F * scale,
+                                     card_left + card_width - 100.0F * scale,
+                                     card_top + 300.0F * scale),
+            .text = L"服务器不分组",
+            .alignment = detail::UiTextAlign::leading,
+        });
+        surface.Add({
+            .id = kServerUngroupedId,
+            .role = detail::UiRole::toggle,
+            .bounds = detail::UiRect(card_left + card_width - 88.0F * scale,
+                                     card_top + 271.0F * scale,
+                                     card_left + card_width - 42.0F * scale,
+                                     card_top + 295.0F * scale),
+            .selected = server_ungrouped,
+        });
+        surface.Add({
+            .role = detail::UiRole::muted,
+            .bounds = detail::UiRect(card_left + 30.0F * scale,
+                                     card_top + 304.0F * scale,
                                      card_left + card_width - 210.0F * scale,
-                                     card_top + 308.0F * scale),
-            .text = L"管理连接地址、认证方式和便携凭据。",
+                                     card_top + 348.0F * scale),
+            .text = L"仅改变侧栏显示，保留已有分组。",
             .alignment = detail::UiTextAlign::leading,
         });
         surface.Add({
             .id = kManageServersId,
             .role = detail::UiRole::primary_button,
             .bounds = detail::UiRect(card_left + card_width - 190.0F * scale,
-                                     card_top + 264.0F * scale,
+                                     card_top + 316.0F * scale,
                                      card_left + card_width - 30.0F * scale,
-                                     card_top + 306.0F * scale),
+                                     card_top + 358.0F * scale),
             .text = L"服务器管理",
             .icon = detail::UiIcon::server,
             .alignment = detail::UiTextAlign::center,
@@ -1584,6 +1636,14 @@ void MainWindow::SetCollapsedServerGroups(
     }
     impl_->collapsed_groups_changed = std::move(changed);
     impl_->PopulateServerList();
+}
+
+void MainWindow::SetServerUngroupedPreference(
+    const bool ungrouped, std::function<bool(bool)> changed_callback) {
+    impl_->server_ungrouped = ungrouped;
+    impl_->server_ungrouped_changed = std::move(changed_callback);
+    impl_->PopulateServerList(true);
+    impl_->CommitLayoutNow();
 }
 
 bool MainWindow::SelectServerSidebarItem(const std::string_view server_id) {

@@ -902,6 +902,23 @@ EditorStatus RemoteDocument::Close() {
     return EditorStatus::Ok();
 }
 
+EditorStatus RemoteDocument::DiscardChanges() {
+    if (!impl_ || impl_->closed) {
+        return EditorStatus::Ok();
+    }
+    const bool was_dirty = impl_->dirty;
+    impl_->dirty = false;
+    const auto status = Close();
+    if (!status) {
+        impl_->dirty = was_dirty;
+        if (was_dirty) {
+            // 删除缓存只完成一半时，尽量恢复可供崩溃恢复的原始修改。
+            (void)impl_->checkpoint();
+        }
+    }
+    return status;
+}
+
 RemoteEditorService::RemoteEditorService(const storage::AppPaths& paths)
     : cache_dir_(paths.editor_cache_dir().lexically_normal()) {}
 

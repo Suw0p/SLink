@@ -164,7 +164,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 `out/build` 保存 CMake 缓存和调试符号；可交付的三个文件位于 `out/bin`。
 `-Clean` 只清理 `out/build`，不会删除 `out/bin` 中的便携数据与凭据。
-Windows 文件属性中的版本与设置页右上角的 `V1.1.1` 均来自 CMake 项目版本。
+Windows 文件属性中的版本与设置页右上角的 `V1.1.2` 均来自 CMake 项目版本。
 
 ## 第三方组件
 

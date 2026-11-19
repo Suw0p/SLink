@@ -516,7 +516,7 @@ struct EditorPage::Impl {
     std::vector<EditorFileEntry> file_entries;
     ViewState directory_state;
     ViewActionCallback view_action;
-    std::array<int, 6> file_column_widths{{-1, -1, -1, -1, -1, -1}};
+    int file_column_width{-1};
 
     SaveRequestCallback save_requested;
     SaveRequestCallback encoding_changed;
@@ -1472,9 +1472,9 @@ struct EditorPage::Impl {
         }
         if (!document->server_name.empty()) {
             std::wstring location = L"服务器 " + document->server_name;
-            if (!document->remote_path.empty()) {
+            if (!document->title.empty()) {
                 location.append(L" · ");
-                location.append(document->remote_path);
+                location.append(document->title);
             }
             status.insert(0, location + L"  |  ");
         }
@@ -1769,25 +1769,13 @@ struct EditorPage::Impl {
     }
 
     std::wstring FileCellText(const std::size_t row, const std::size_t column) const {
-        if (row >= file_entries.size())
+        if (row >= file_entries.size() || column != 0)
             return {};
         const EditorFileEntry& entry = file_entries[row];
-        switch (column) {
-        case 0:
-            return entry.local_shortcut ? local_shortcut::DisplayName(entry.name) : entry.name;
-        case 1:
-            return entry.status;
-        case 2:
-            return entry.size;
-        case 3:
-            return entry.modified;
-        case 4:
-            return entry.permissions;
-        case 5:
-            return entry.owner;
-        default:
-            return {};
+        if (entry.placeholder && !entry.status.empty()) {
+            return entry.name + L" · " + entry.status;
         }
+        return entry.local_shortcut ? local_shortcut::DisplayName(entry.name) : entry.name;
     }
 
     int FileIcon(const std::size_t row) const {
@@ -2330,42 +2318,9 @@ struct EditorPage::Impl {
                    file_width,
                    std::max(0, height - file_list_y - pad),
                    TRUE);
-        const std::array<int, 6> minimum_widths = {detail::ScaleForDpi(180, dpi),
-                                                   detail::ScaleForDpi(78, dpi),
-                                                   detail::ScaleForDpi(72, dpi),
-                                                   detail::ScaleForDpi(112, dpi),
-                                                   detail::ScaleForDpi(80, dpi),
-                                                   detail::ScaleForDpi(90, dpi)};
-        const std::array<int, 6> preferred_widths = {std::clamp(file_width * 43 / 100,
-                                                                detail::ScaleForDpi(220, dpi),
-                                                                detail::ScaleForDpi(520, dpi)),
-                                                     detail::ScaleForDpi(110, dpi),
-                                                     detail::ScaleForDpi(88, dpi),
-                                                     detail::ScaleForDpi(132, dpi),
-                                                     detail::ScaleForDpi(92, dpi),
-                                                     detail::ScaleForDpi(110, dpi)};
-        std::array<int, 6> desired_widths = minimum_widths;
-        const int minimum_total = std::accumulate(minimum_widths.begin(), minimum_widths.end(), 0);
-        const int preferred_total =
-            std::accumulate(preferred_widths.begin(), preferred_widths.end(), 0);
-        if (file_width > minimum_total) {
-            const int available_growth = file_width - minimum_total;
-            const int preferred_growth = preferred_total - minimum_total;
-            if (preferred_growth > 0) {
-                const double ratio = std::min(1.0,
-                                              static_cast<double>(available_growth) /
-                                                  static_cast<double>(preferred_growth));
-                for (std::size_t column = 0; column < desired_widths.size(); ++column) {
-                    desired_widths[column] += static_cast<int>(
-                        std::lround((preferred_widths[column] - minimum_widths[column]) * ratio));
-                }
-            }
-            const int used = std::accumulate(desired_widths.begin(), desired_widths.end(), 0);
-            desired_widths.back() += std::max(0, file_width - used);
-        }
-        if (file_column_widths != desired_widths) {
-            table::SetColumnWidths(file_list, desired_widths);
-            file_column_widths = desired_widths;
+        if (file_column_width != file_width) {
+            table::SetColumnWidth(file_list, 0, file_width);
+            file_column_width = file_width;
         }
 
         const int tab_y = 0;
@@ -2540,13 +2495,9 @@ bool EditorPage::Create(HWND parent, HINSTANCE instance) {
     impl_->file_icon = system_file_icons.file;
     table::SetImageList(impl_->file_list, system_file_icons.image_list);
     const std::array file_columns{
-        table::Column{L"名称", detail::ScaleForDpi(220, dpi), detail::ScaleForDpi(180, dpi)},
-        table::Column{L"状态", detail::ScaleForDpi(100, dpi), detail::ScaleForDpi(78, dpi)},
-        table::Column{L"大小", detail::ScaleForDpi(88, dpi), detail::ScaleForDpi(72, dpi)},
-        table::Column{L"修改时间", detail::ScaleForDpi(132, dpi), detail::ScaleForDpi(112, dpi)},
-        table::Column{L"权限", detail::ScaleForDpi(92, dpi), detail::ScaleForDpi(80, dpi)},
-        table::Column{L"所有者", detail::ScaleForDpi(110, dpi), detail::ScaleForDpi(90, dpi)}};
+        table::Column{L"名称", detail::ScaleForDpi(220, dpi), 1}};
     table::SetColumns(impl_->file_list, file_columns);
+    table::SetFillLastColumn(impl_->file_list, true);
     table::SetTextProvider(impl_->file_list,
                            [page = impl_.get()](const std::size_t row, const std::size_t column) {
                                return page->FileCellText(row, column);
@@ -3037,6 +2988,11 @@ std::optional<std::string> EditorPage::DocumentText(EditorDocumentId id) {
         impl_->SyncActiveContent();
     }
     return document->content;
+}
+
+bool EditorPage::DocumentSaving(EditorDocumentId id) const noexcept {
+    const auto* document = impl_->FindDocument(id);
+    return document && document->saving;
 }
 
 std::optional<EditorDocumentId> EditorPage::active_document() const noexcept {

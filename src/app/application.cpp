@@ -2171,6 +2171,23 @@ int Application::Run(HINSTANCE instance, int show_command) {
             }
             return saved.ok();
         });
+    bool server_sidebar_ungrouped = false;
+    if (auto stored = impl_->repository->GetSetting("server_sidebar_ungrouped");
+        stored && stored.value()) {
+        server_sidebar_ungrouped = *stored.value() == "true";
+    }
+    impl_->main_window->SetServerUngroupedPreference(
+        server_sidebar_ungrouped, [application_state](const bool ungrouped) {
+            const auto saved = application_state->repository->SetSetting(
+                "server_sidebar_ungrouped", ungrouped ? "true" : "false");
+            if (!saved) {
+                MessageBoxW(application_state->main_window->hwnd(),
+                            (L"无法保存服务器列表显示设置。\r\n\r\n" + saved.message).c_str(),
+                            L"SLink",
+                            MB_OK | MB_ICONERROR);
+            }
+            return saved.ok();
+        });
     impl_->ui_dispatcher =
         std::make_shared<ssh::FunctionUiDispatcher>([main_window](std::function<void()> callback) {
             main_window->PostUiTask(std::move(callback));
