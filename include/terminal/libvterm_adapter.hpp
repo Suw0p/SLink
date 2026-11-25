@@ -32,6 +32,7 @@ public:
     void synchronize_cursor_row();
     [[nodiscard]] TerminalDamage take_damage();
     void set_event_callback(TerminalEventCallback callback);
+    void set_scrollback_byte_limit(std::size_t bytes);
 
     [[nodiscard]] std::size_t rows() const noexcept;
     [[nodiscard]] std::size_t columns() const noexcept;

@@ -309,6 +309,7 @@ public:
     void add_job_order_locked(const TransferId id) {
         if (std::ranges::find(job_order, id) == job_order.end()) {
             job_order.push_back(id);
+            job_structure_revision = ++job_revision;
         }
     }
 
@@ -326,6 +327,9 @@ public:
     }
 
     void queue_notification_locked(const TransferJob& snapshot) {
+        job_changes.emplace_back(++job_revision, snapshot.id);
+        while (job_changes.size() > kMaximumDetailChanges)
+            job_changes.pop_front();
         if (observer)
             notifications.push_back(snapshot);
     }
@@ -534,8 +538,7 @@ public:
 #ifdef SLINK_ENABLE_PERF_TRACE
             progress_lock_wait_us =
                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                               std::chrono::steady_clock::now() -
-                                               lock_wait_started)
+                                               std::chrono::steady_clock::now() - lock_wait_started)
                                                .count());
 #endif
             if (bytes >
@@ -1262,6 +1265,9 @@ public:
     TransferObserver observer;
     std::deque<TransferJob> notifications;
     bool dispatching_notifications{};
+    std::uint64_t job_revision{1};
+    std::uint64_t job_structure_revision{1};
+    std::deque<std::pair<std::uint64_t, TransferId>> job_changes;
 };
 
 TransferManager::TransferManager(EndpointResolver resolver,
@@ -1464,6 +1470,8 @@ std::size_t TransferManager::clear_terminal() {
         std::erase_if(impl_->job_order, [this](const TransferId id) {
             return !impl_->controls.contains(id);
         });
+        if (removed)
+            impl_->job_structure_revision = ++impl_->job_revision;
         if (!impl_->job_order.empty()) {
             impl_->round_robin_index %= impl_->job_order.size();
         } else {
@@ -1523,6 +1531,36 @@ std::vector<TransferJob> TransferManager::jobs() const {
         result.push_back(control->job);
     }
     std::ranges::sort(result, {}, &TransferJob::id);
+    return result;
+}
+
+TransferJobSnapshot TransferManager::job_snapshot(const std::uint64_t after_revision) const {
+    std::scoped_lock lock(impl_->mutex);
+    TransferJobSnapshot result;
+    result.revision = impl_->job_revision;
+    if (after_revision == result.revision)
+        return result;
+    result.reset =
+        after_revision == 0 || after_revision > result.revision ||
+        after_revision < impl_->job_structure_revision ||
+        (!impl_->job_changes.empty() && after_revision < impl_->job_changes.front().first - 1);
+    if (result.reset) {
+        result.items.reserve(impl_->controls.size());
+        for (const auto& [id, control] : impl_->controls)
+            result.items.push_back(control->job);
+    } else {
+        std::unordered_set<TransferId> ids;
+        for (auto it = impl_->job_changes.rbegin();
+             it != impl_->job_changes.rend() && it->first > after_revision;
+             ++it)
+            ids.insert(it->second);
+        result.items.reserve(ids.size());
+        for (const auto id : ids) {
+            if (const auto found = impl_->controls.find(id); found != impl_->controls.end())
+                result.items.push_back(found->second->job);
+        }
+    }
+    std::ranges::sort(result.items, {}, &TransferJob::id);
     return result;
 }
 

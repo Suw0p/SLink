@@ -1806,6 +1806,13 @@ struct TerminalPage::Impl {
     }
 
     void Layout(int width, int height) {
+        // 同一页面拥有全部终端标签。按标签数均分预算，变化时立即裁剪最旧历史，
+        // 让隐藏标签也受总量限制；单标签仍遵守模型的 32MiB/10000 行上限。
+        if (!panes.empty()) {
+            const auto limit = TerminalPage::kMaximumTotalScrollbackBytes / panes.size();
+            for (auto& pane : panes)
+                pane->SetScrollbackByteLimit(limit);
+        }
         if (width <= 0 || height <= 0) {
             pane_area = {};
             pane_rects.clear();

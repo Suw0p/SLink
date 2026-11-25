@@ -110,6 +110,8 @@ public:
     // 屏幕解析器，回滚行由 libvterm 回调提供。
     void enable_state_tracking_only();
     void push_scrollback_line(TerminalLine line);
+    void set_scrollback_byte_limit(std::size_t bytes);
+    [[nodiscard]] std::size_t scrollback_byte_limit() const noexcept;
 
     [[nodiscard]] std::size_t rows() const noexcept;
     [[nodiscard]] std::size_t columns() const noexcept;

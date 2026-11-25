@@ -98,6 +98,7 @@ struct TerminalBuffer::Impl {
     CursorPosition saved_cursor;
     std::deque<TerminalLine> history;
     std::size_t history_bytes{};
+    std::size_t history_byte_limit{TerminalBuffer::kMaximumScrollbackBytes};
     CellAttributes attributes;
     ParseState parse_state{ParseState::Ground};
     std::string control;
@@ -156,7 +157,7 @@ struct TerminalBuffer::Impl {
 
     void TrimHistory() {
         while (!history.empty() && (history.size() > TerminalBuffer::kMaximumScrollbackLines ||
-                                    history_bytes > TerminalBuffer::kMaximumScrollbackBytes)) {
+                                    history_bytes > history_byte_limit)) {
             history_bytes -= LineBytes(history.front());
             history.pop_front();
         }
@@ -841,6 +842,13 @@ void TerminalBuffer::enable_state_tracking_only() {
 }
 void TerminalBuffer::push_scrollback_line(TerminalLine line) {
     impl_->PushExternalHistory(std::move(line));
+}
+void TerminalBuffer::set_scrollback_byte_limit(const std::size_t bytes) {
+    impl_->history_byte_limit = std::min(bytes, kMaximumScrollbackBytes);
+    impl_->TrimHistory();
+}
+std::size_t TerminalBuffer::scrollback_byte_limit() const noexcept {
+    return impl_->history_byte_limit;
 }
 std::size_t TerminalBuffer::rows() const noexcept {
     return impl_->row_count;

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(SLink
-    VERSION 1.1.2
+    VERSION 1.1.3
     DESCRIPTION "SLink"
     LANGUAGES C CXX RC)
 
@@ -191,6 +191,7 @@ add_library(swb_ui STATIC
     src/ui/transfer_conflict_dialog.cpp
     src/ui/file_operation_dialogs.cpp
     src/ui/transfer_page.cpp
+    src/ui/shell_file_drag.cpp
     src/ui/transfer_file_rows.cpp
     src/ui/transfer_pane_history.cpp
     src/ui/transfer_page_surface.cpp

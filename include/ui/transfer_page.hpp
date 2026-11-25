@@ -81,6 +81,9 @@ public:
     // 它的 Reactor 所在线程。
     void SetAsyncDirectoryList(AsyncDirectoryList callback);
     void SetTransferManager(std::shared_ptr<transfer::TransferManager> manager);
+    void SetShellDragResolver(transfer::CancellableEndpointResolver resolver);
+    // 应用退出必须先停止外拖读取，再销毁传输连接池。
+    void ShutdownShellDrags() noexcept;
     void SetRemoteEditCallback(RemoteEditCallback callback);
     void SetPaneClosedCallback(PaneClosedCallback callback);
     void SetPaneNavigatedCallback(PaneNavigatedCallback callback);

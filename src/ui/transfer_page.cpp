@@ -9,6 +9,7 @@
 #include "ui/file_operation_dialogs.hpp"
 #include "ui/local_shortcut.hpp"
 #include "ui/retained_ui.hpp"
+#include "ui/shell_file_drag.hpp"
 #include "ui/table_control.hpp"
 #include "ui/transfer_conflict_dialog.hpp"
 #include "ui/transfer_file_rows.hpp"
@@ -501,6 +502,9 @@ struct TransferPage::Impl {
     int file_icon{};
     std::vector<Pane> panes;
     std::vector<transfer::TransferJob> queue_jobs;
+    std::uint64_t queue_jobs_revision{};
+    std::unordered_map<transfer::TransferId, std::size_t> queue_job_indexes;
+    std::unordered_set<transfer::TransferId> queue_active_jobs;
     std::vector<QueueRow> queue_rows;
     std::unordered_map<transfer::TransferId, std::size_t> queue_job_rows;
     std::unordered_map<transfer::TransferId,
@@ -529,7 +533,7 @@ struct TransferPage::Impl {
     std::vector<TransferServerOption> server_options;
     TransferPaneId next_id{2};
     TransferPaneId active_pane_id{1};
-    bool internal_drag{};
+    bool shell_drag_active{};
     ResizeMode resize_mode{ResizeMode::none};
     std::size_t resize_index{};
     POINT resize_origin{};
@@ -581,6 +585,7 @@ struct TransferPage::Impl {
     PaneActionCallback pane_action_callback;
     std::shared_ptr<AsyncLifetime> async_lifetime{std::make_shared<AsyncLifetime>()};
     detail::BackgroundExecutor background_executor;
+    detail::ShellFileDrag shell_drag;
 
     static LRESULT CALLBACK InlineNameEditSubclass(HWND control,
                                                    UINT message,
@@ -681,12 +686,6 @@ struct TransferPage::Impl {
                 self->UpdateResize({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
                 return 0;
             }
-            if (self->internal_drag) {
-                POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-                ClientToScreen(window, &point);
-                self->UpdateInternalDragTarget(point);
-                return 0;
-            }
             self->HandlePointerMove({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)}, wparam);
             return 0;
         case WM_MOUSELEAVE:
@@ -696,8 +695,7 @@ struct TransferPage::Impl {
             if (self->BeginResize({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)})) {
                 return 0;
             }
-            if (!self->internal_drag &&
-                self->HandlePointerDown({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)})) {
+            if (self->HandlePointerDown({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)})) {
                 return 0;
             }
             break;
@@ -706,20 +704,8 @@ struct TransferPage::Impl {
                 self->EndResize();
                 return 0;
             }
-            if (self->internal_drag) {
-                POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-                ClientToScreen(window, &point);
-                self->CompleteInternalDrag(point);
-                return 0;
-            }
             self->HandlePointerUp({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
             return 0;
-        case WM_KEYDOWN:
-            if (wparam == VK_ESCAPE && self->internal_drag) {
-                self->CancelInternalDrag();
-                return 0;
-            }
-            break;
         case WM_CAPTURECHANGED:
             if (self->resize_mode != ResizeMode::none) {
                 ShowWindow(self->resize_guide, SW_HIDE);
@@ -733,17 +719,10 @@ struct TransferPage::Impl {
             self->resize_preview_position = -1;
             self->resize_mode = ResizeMode::none;
             self->resize_start_weights.clear();
-            if (self->internal_drag && reinterpret_cast<HWND>(lparam) != window) {
-                self->CancelInternalDrag();
-            }
             self->CancelTabDrag();
             self->surface.CancelPointer();
             return 0;
         case WM_SETCURSOR:
-            if (self->internal_drag) {
-                SetCursor(LoadCursorW(nullptr, self->drag_drop_allowed ? IDC_ARROW : IDC_NO));
-                return TRUE;
-            }
             if (self->SetResizeCursor()) {
                 return TRUE;
             }
@@ -940,10 +919,6 @@ struct TransferPage::Impl {
                         self->RequestList(*pane, pane->location);
                         return 0;
                     }
-                    if (wparam == VK_ESCAPE && self->internal_drag) {
-                        self->CancelInternalDrag();
-                        return 0;
-                    }
                     if (wparam == VK_BACK) {
                         self->NavigateParent(*pane);
                         return 0;
@@ -959,6 +934,7 @@ struct TransferPage::Impl {
                     return 0;
                 }
             } else if (message == WM_NCDESTROY) {
+                self->shell_drag.UnregisterTarget(control);
                 DragAcceptFiles(control, FALSE);
                 RemoveWindowSubclass(control, &ControlSubclassProc, 1);
             }
@@ -1061,6 +1037,7 @@ struct TransferPage::Impl {
     }
 
     void OnWindowDestroyed(HWND window) {
+        shell_drag.Shutdown();
         KillTimer(window, kQueueTimerId);
         KillTimer(window, kLayoutTimerId);
         KillTimer(window, kTabMotionTimerId);
@@ -1547,7 +1524,7 @@ struct TransferPage::Impl {
     }
 
     bool BeginResize(POINT point) {
-        if (internal_drag) {
+        if (shell_drag_active) {
             return false;
         }
         const auto [mode, index] = ResizeHandleAt(point);
@@ -2072,9 +2049,13 @@ struct TransferPage::Impl {
         sample.sampled_at = now;
     }
 
-    void UpdateQueueSpeeds() {
+    void UpdateQueueSpeeds(const std::unordered_set<transfer::TransferId>& ids) {
         const auto now = std::chrono::steady_clock::now();
-        for (const auto& job : queue_jobs) {
+        for (const auto id : ids) {
+            const auto found = queue_job_indexes.find(id);
+            if (found == queue_job_indexes.end())
+                continue;
+            const auto& job = queue_jobs[found->second];
             UpdateSpeedSample(queue_job_speeds[job.id], job.bytes_transferred, job.state, now);
             const auto detail = queue_details.find(job.id);
             const auto running = queue_running_visible_items.find(job.id);
@@ -2369,21 +2350,19 @@ struct TransferPage::Impl {
             }
         }
         active_pane_id = pane.id;
-        internal_drag = true;
-        SetCapture(hwnd);
-        POINT point{};
-        GetCursorPos(&point);
-        UpdateInternalDragTarget(point);
+        // OLE 拖放循环同时服务桌面/Explorer 和本程序窗格；不再独占鼠标捕获。
+        // 数据对象保存源快照，异步下载不依赖 Pane 或其 HWND。
+        shell_drag_active = true;
+        const auto result = shell_drag.Run({drag_uris, drag_directory_uris});
+        shell_drag_active = false;
+        CancelInternalDrag();
+        if (FAILED(result)) Report(L"无法拖出文件，请检查文件名、连接状态或系统资源");
     }
 
     void CancelInternalDrag() {
         ClearInternalDragTarget();
-        internal_drag = false;
         drag_uris.clear();
         drag_directory_uris.clear();
-        if (GetCapture() == hwnd) {
-            ReleaseCapture();
-        }
     }
 
     void CompleteInternalDrag(const POINT screen_point) {
@@ -2391,12 +2370,8 @@ struct TransferPage::Impl {
         const std::vector<transfer::FileUri> sources = drag_uris;
         const auto target_base = drag_target_base;
         ClearInternalDragTarget();
-        internal_drag = false;
         drag_uris.clear();
         drag_directory_uris.clear();
-        if (GetCapture() == hwnd) {
-            ReleaseCapture();
-        }
         if (!target_base || sources.empty()) {
             return;
         }
@@ -3255,7 +3230,22 @@ struct TransferPage::Impl {
             pane.path_control, &ControlSubclassProc, 2, reinterpret_cast<DWORD_PTR>(this));
         SetWindowSubclass(
             pane.refresh_button, &ControlSubclassProc, 4, reinterpret_cast<DWORD_PTR>(this));
-        DragAcceptFiles(pane.list, TRUE);
+        const auto pane_id = pane.id;
+        const auto receive_drop =
+            [this, pane_id](const detail::ShellFileSelection& selection, POINT point, bool drop) {
+                if (!FindPane(pane_id)) return false;
+                drag_uris = selection.sources;
+                drag_directory_uris = selection.directories;
+                UpdateInternalDragTarget(point);
+                const bool allowed = drag_drop_allowed && drag_target_pane_id == pane_id;
+                if (drop && allowed) CompleteInternalDrag(point);
+                return allowed;
+            };
+        const auto leave_drop = [this] { ClearInternalDragTarget(); };
+        const HRESULT drop_registered = shell_drag.RegisterTarget(pane.list, receive_drop, leave_drop);
+        (void)shell_drag.RegisterTarget(pane.container, receive_drop, leave_drop);
+        // OLE 未初始化时保留原有系统文件拖入兼容路径。
+        DragAcceptFiles(pane.list, FAILED(drop_registered));
         for (HWND control : {pane.container,
                              pane.title_control,
                              pane.up_button,
@@ -3936,6 +3926,9 @@ struct TransferPage::Impl {
         }
         if (!transfer_manager) {
             queue_jobs.clear();
+            queue_jobs_revision = 0;
+            queue_job_indexes.clear();
+            queue_active_jobs.clear();
             queue_rows.clear();
             queue_details.clear();
             queue_job_rows.clear();
@@ -3947,56 +3940,77 @@ struct TransferPage::Impl {
             queue_layout_dirty = true;
             return;
         }
-        std::vector<transfer::TransferJob> previous_jobs = std::move(queue_jobs);
+        transfer::TransferJobSnapshot snapshot;
         try {
-            queue_jobs = transfer_manager->jobs();
+            snapshot = transfer_manager->job_snapshot(queue_jobs_revision);
         } catch (const std::exception& error) {
-            queue_jobs = std::move(previous_jobs);
             Report(ExceptionText(error));
             return;
         }
-        bool structure_changed = queue_layout_dirty || queue_jobs.size() != previous_jobs.size();
-        if (!structure_changed) {
-            for (std::size_t index = 0; index < queue_jobs.size(); ++index) {
-                if (queue_jobs[index].id != previous_jobs[index].id ||
-                    queue_jobs[index].source_is_directory !=
-                        previous_jobs[index].source_is_directory) {
-                    structure_changed = true;
-                    break;
+        bool structure_changed = queue_layout_dirty || snapshot.reset;
+        std::unordered_set<transfer::TransferId> touched = queue_active_jobs;
+        if (snapshot.reset) {
+            queue_jobs = std::move(snapshot.items);
+            queue_job_indexes.clear();
+            queue_active_jobs.clear();
+            for (std::size_t i = 0; i < queue_jobs.size(); ++i) {
+                const auto& job = queue_jobs[i];
+                queue_job_indexes.emplace(job.id, i);
+                touched.insert(job.id);
+                if (job.state == transfer::TransferState::Running)
+                    queue_active_jobs.insert(job.id);
+            }
+            const auto removed = [this](const auto& item) {
+                return !queue_job_indexes.contains(item.first);
+            };
+            std::erase_if(queue_details, removed);
+            std::erase_if(queue_job_speeds, removed);
+            std::erase_if(queue_item_speeds, removed);
+            std::erase_if(queue_running_visible_items, removed);
+            std::erase_if(expanded_queue_jobs, [this](const auto id) {
+                return !queue_job_indexes.contains(id);
+            });
+            std::erase_if(observed_terminal_jobs, [this](const auto id) {
+                return !queue_job_indexes.contains(id);
+            });
+        } else {
+            for (auto& job : snapshot.items) {
+                const auto found = queue_job_indexes.find(job.id);
+                if (found == queue_job_indexes.end()) {
+                    queue_jobs_revision = 0;
+                    return;
                 }
+                auto& previous = queue_jobs[found->second];
+                structure_changed |= previous.source_is_directory != job.source_is_directory;
+                touched.insert(job.id);
+                if (job.state == transfer::TransferState::Running)
+                    queue_active_jobs.insert(job.id);
+                else
+                    queue_active_jobs.erase(job.id);
+                previous = std::move(job);
             }
         }
+        queue_jobs_revision = snapshot.revision;
         std::vector<std::pair<transfer::TransferId, transfer::TransferItemId>> changed_items;
-        std::unordered_set<transfer::TransferId> current_ids;
-        current_ids.reserve(queue_jobs.size());
-        for (const auto& job : queue_jobs) {
-            current_ids.insert(job.id);
+        // 只有展开的父任务需要查询子项；未变化的历史任务不参与定时复制/扫描。
+        for (const auto job_id : expanded_queue_jobs) {
+            const auto found = queue_job_indexes.find(job_id);
+            if (found == queue_job_indexes.end())
+                continue;
+            const auto& job = queue_jobs[found->second];
             try {
                 auto update = UpdateQueueDetail(job);
                 structure_changed |= update.topology_changed;
+                if (update.topology_changed || !update.changed_items.empty())
+                    touched.insert(job.id);
                 for (const auto id : update.changed_items) {
                     changed_items.emplace_back(job.id, id);
                 }
             } catch (const std::exception&) {
-                // A terminal entry can be cleared between jobs() and the
+                // A terminal entry can be cleared between job_snapshot() and the
                 // detail query. The next timer tick rebuilds the view.
             }
         }
-        std::erase_if(queue_details, [&current_ids](const auto& item) {
-            return !current_ids.contains(item.first);
-        });
-        std::erase_if(expanded_queue_jobs, [&current_ids](const auto id) {
-            return !current_ids.contains(id);
-        });
-        std::erase_if(queue_job_speeds, [&current_ids](const auto& item) {
-            return !current_ids.contains(item.first);
-        });
-        std::erase_if(queue_item_speeds, [&current_ids](const auto& item) {
-            return !current_ids.contains(item.first);
-        });
-        std::erase_if(queue_running_visible_items, [&current_ids](const auto& item) {
-            return !current_ids.contains(item.first);
-        });
         if (structure_changed) {
             BuildQueueRows();
             queue_layout_dirty = false;
@@ -4019,7 +4033,7 @@ struct TransferPage::Impl {
                 }
             }
         }
-        UpdateQueueSpeeds();
+        UpdateQueueSpeeds(touched);
         if (structure_changed) {
             if (table::RowCount(queue_list) != queue_rows.size()) {
                 table::SetRowCount(queue_list, queue_rows.size());
@@ -4028,10 +4042,21 @@ struct TransferPage::Impl {
             }
         } else {
             std::vector<std::size_t> dirty_rows;
-            dirty_rows.reserve(queue_jobs.size() + changed_items.size() + 8);
-            for (const auto& job : queue_jobs) {
-                if (const auto found = queue_job_rows.find(job.id); found != queue_job_rows.end()) {
+            dirty_rows.reserve(touched.size() + changed_items.size() + 8);
+            for (const auto id : touched) {
+                if (const auto found = queue_job_rows.find(id); found != queue_job_rows.end()) {
                     dirty_rows.push_back(found->second);
+                }
+                if (const auto running = queue_running_visible_items.find(id);
+                    running != queue_running_visible_items.end()) {
+                    const auto visible = queue_visible_item_rows.find(id);
+                    if (visible != queue_visible_item_rows.end()) {
+                        for (const auto item_id : running->second) {
+                            if (const auto row = visible->second.find(item_id);
+                                row != visible->second.end())
+                                dirty_rows.push_back(row->second);
+                        }
+                    }
                 }
             }
             for (const auto [job_id, item_id] : changed_items) {
@@ -4047,7 +4072,11 @@ struct TransferPage::Impl {
             table::RefreshRows(queue_list, dirty_rows);
         }
 
-        for (const auto& job : queue_jobs) {
+        for (const auto id : touched) {
+            const auto found = queue_job_indexes.find(id);
+            if (found == queue_job_indexes.end())
+                continue;
+            const auto& job = queue_jobs[found->second];
             const bool terminal = job.state == transfer::TransferState::Completed ||
                                   job.state == transfer::TransferState::Failed ||
                                   job.state == transfer::TransferState::Cancelled;
@@ -4468,6 +4497,7 @@ struct TransferPage::Impl {
 TransferPage::TransferPage() : impl_(std::make_unique<Impl>()) {}
 
 TransferPage::~TransferPage() {
+    impl_->shell_drag.Shutdown();
     if (impl_->hwnd) {
         DestroyWindow(impl_->hwnd);
     }
@@ -4754,6 +4784,14 @@ void TransferPage::SetAsyncDirectoryList(AsyncDirectoryList callback) {
 }
 
 void TransferPage::SetTransferManager(std::shared_ptr<transfer::TransferManager> manager) {
+    if (impl_->transfer_manager != manager) {
+        impl_->queue_details.clear();
+        impl_->queue_job_speeds.clear();
+        impl_->queue_item_speeds.clear();
+        impl_->observed_terminal_jobs.clear();
+        impl_->queue_layout_dirty = true;
+    }
+    impl_->queue_jobs_revision = 0;
     impl_->transfer_manager = std::move(manager);
     if (impl_->transfer_manager) {
         const auto concurrency =
@@ -4763,6 +4801,14 @@ void TransferPage::SetTransferManager(std::shared_ptr<transfer::TransferManager>
     impl_->SyncConcurrencyEdit();
     impl_->RefreshQueue();
     impl_->Relayout();
+}
+
+void TransferPage::SetShellDragResolver(transfer::CancellableEndpointResolver resolver) {
+    impl_->shell_drag.SetResolver(std::move(resolver));
+}
+
+void TransferPage::ShutdownShellDrags() noexcept {
+    impl_->shell_drag.Shutdown();
 }
 
 void TransferPage::SetRemoteEditCallback(RemoteEditCallback callback) {

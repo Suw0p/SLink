@@ -40,6 +40,11 @@ public:
     void SetBounds(int x, int y, int width, int height);
     void Show(bool visible);
     void ApplyTheme();
+    // 只限制回滚，不修改当前屏幕和 SSH/PTY 尺寸；必须在 UI 线程调用。
+    void SetScrollbackByteLimit(std::size_t bytes);
+    [[nodiscard]] std::size_t scrollback_bytes() const noexcept;
+    [[nodiscard]] std::size_t scrollback_byte_limit() const noexcept;
+    [[nodiscard]] bool has_back_buffer() const noexcept;
 
     // SSH 等远端传输字节先按当前会话编码解码；SLink 自己生成的 UTF-8 提示必须使用
     // FeedUtf8，避免在 GB18030 会话中被重复转码。两者均可从非 UI 线程调用。

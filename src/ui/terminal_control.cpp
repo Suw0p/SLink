@@ -1800,6 +1800,27 @@ void TerminalControl::Show(bool visible) {
 void TerminalControl::ApplyTheme() {
     impl_->ApplyTheme();
 }
+void TerminalControl::SetScrollbackByteLimit(const std::size_t bytes) {
+    const auto previous = impl_->HistorySize();
+    impl_->model.set_scrollback_byte_limit(bytes);
+    if (impl_->HistorySize() != previous) {
+        impl_->view_offset = std::min(impl_->view_offset, impl_->HistorySize());
+        impl_->selection_start.reset();
+        impl_->selection_end.reset();
+        impl_->selection_has_extent = false;
+        if (impl_->hwnd)
+            InvalidateRect(impl_->hwnd, nullptr, FALSE);
+    }
+}
+std::size_t TerminalControl::scrollback_bytes() const noexcept {
+    return impl_->State().scrollback_bytes();
+}
+std::size_t TerminalControl::scrollback_byte_limit() const noexcept {
+    return impl_->State().scrollback_byte_limit();
+}
+bool TerminalControl::has_back_buffer() const noexcept {
+    return impl_->buffer_bitmap != nullptr;
+}
 
 void TerminalControl::FeedTransportBytes(const std::string_view bytes) {
     impl_->QueueFeed(Impl::FeedKind::transport, bytes);

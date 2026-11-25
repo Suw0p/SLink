@@ -1,12 +1,12 @@
 #pragma once
 
 #include <windows.h>
+#include "ui/view_state.hpp"
 #include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
-#include "ui/view_state.hpp"
 
 namespace SLink::ui {
 
@@ -17,6 +17,7 @@ class TerminalControl;
 // 页面本身不建立 SSH 连接，只通过回调把连接和关闭请求交给应用控制器。
 class TerminalPage final {
 public:
+    static constexpr std::size_t kMaximumTotalScrollbackBytes = 256ULL * 1024ULL * 1024ULL;
     using ServerActivatedCallback =
         std::function<void(std::string_view server_id, std::size_t pane_index)>;
     using PaneClosingCallback = std::function<void(std::size_t pane_index)>;

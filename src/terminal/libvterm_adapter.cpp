@@ -427,6 +427,9 @@ TerminalDamage LibVTermAdapter::take_damage() {
 void LibVTermAdapter::set_event_callback(TerminalEventCallback callback) {
     impl_->fallback.set_event_callback(std::move(callback));
 }
+void LibVTermAdapter::set_scrollback_byte_limit(const std::size_t bytes) {
+    impl_->fallback.set_scrollback_byte_limit(bytes);
+}
 
 std::size_t LibVTermAdapter::rows() const noexcept {
     return impl_->rows;

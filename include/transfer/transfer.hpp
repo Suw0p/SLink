@@ -81,6 +81,14 @@ struct TransferDetailSnapshot {
     std::vector<TransferItemProgress> items;
 };
 
+// UI 父任务增量视图。结构变化或调用者落后于有界日志时 reset=true；否则只返回
+// 自 after_revision 以来发生变化的父任务，空闲刷新不复制历史任务及路径字符串。
+struct TransferJobSnapshot {
+    std::uint64_t revision{};
+    bool reset{};
+    std::vector<TransferJob> items;
+};
+
 using EndpointResolver = std::function<std::shared_ptr<IFileEndpoint>(const FileUri& uri)>;
 using CancellableEndpointResolver = std::function<std::shared_ptr<IFileEndpoint>(
     const FileUri& uri, std::shared_ptr<const std::atomic_bool> cancellation)>;
@@ -153,6 +161,7 @@ public:
     [[nodiscard]] std::size_t concurrency() const noexcept;
     [[nodiscard]] std::optional<TransferJob> get(TransferId id) const;
     [[nodiscard]] std::vector<TransferJob> jobs() const;
+    [[nodiscard]] TransferJobSnapshot job_snapshot(std::uint64_t after_revision = 0) const;
     [[nodiscard]] TransferDetailSnapshot details(TransferId id,
                                                  std::uint64_t after_revision = 0) const;
     [[nodiscard]] bool wait(TransferId id, std::chrono::milliseconds timeout) const;

@@ -1967,6 +1967,7 @@ struct Application::Impl {
     }
 
     void StopFileProducers() {
+        if (main_window) main_window->transfer_page().ShutdownShellDrags();
         // 先停止会产生新文件/SFTP 工作的上层对象。EditorController 先停止编辑线程，
         // TransferManager 随后等待全部传输工作线程退出，连接池此后不会再收到新租约。
         local_editor_directory_executor.reset();
@@ -2441,6 +2442,13 @@ int Application::Run(HINSTANCE instance, int show_command) {
     });
     impl_->RestoreTransferJobs();
     transfer.SetTransferManager(impl_->transfer_manager);
+    transfer.SetShellDragResolver(
+        [application_state](const transfer::FileUri& uri,
+                            std::shared_ptr<const std::atomic_bool> cancellation) {
+            if (!application_state->transfer_sessions)
+                return std::shared_ptr<transfer::IFileEndpoint>{};
+            return application_state->transfer_sessions->Acquire(uri, std::move(cancellation));
+        });
     transfer.SetOpenRemoteSessionCallback([application_state](std::string server_id) {
         application_state->OpenTransferServer(std::move(server_id));
     });
