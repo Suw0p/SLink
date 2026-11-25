@@ -38,7 +38,8 @@ public:
     EditorController(const EditorController&) = delete;
     EditorController& operator=(const EditorController&) = delete;
 
-    // 异步打开本地或 SFTP URI；同一 URI 已打开时只激活原标签，不重复下载或建缓存。
+    // 异步打开本地或 SFTP URI；已有标签只激活，已关闭文档存在 dirty 缓存时
+    // 恢复本地修改，保存时仍按原始修订检查冲突，不会自动覆盖服务器内容。
     void Open(transfer::FileUri uri);
 
     // 枚举 editor_cache_dir 下的 dirty 恢复记录，并异步恢复当前可解析端点的文档。
@@ -46,8 +47,11 @@ public:
 
     // 文件会话重连后，将该服务器已打开文档从旧端点切换到新端点。
     // 调用在 UI 线程返回；实际绑定按编辑工作队列顺序异步完成。
-    void RebindEndpoint(std::string server_id,
-                        std::shared_ptr<transfer::IFileEndpoint> endpoint);
+    void RebindEndpoint(std::string server_id, std::shared_ptr<transfer::IFileEndpoint> endpoint);
+
+    // 退出前异步提交最新 UI 快照。调用期间宿主应禁止新的编辑，回调始终在 UI 线程。
+    // false 表示缓存失败，必须保留窗口/控制器，允许用户重试或另存备份，不能直接析构。
+    void PrepareForShutdown(std::function<void(bool)> completed);
 
     // 除 EndpointResolver 在编辑工作线程执行外，下列 provider 均在 UI 线程调用。
     // UI provider 必须立即返回；EndpointResolver 可以等待已连接端点，但不能弹窗。

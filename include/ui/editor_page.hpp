@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include "ui/view_state.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -10,7 +11,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include "ui/view_state.hpp"
 
 namespace SLink::ui {
 
@@ -131,6 +131,8 @@ public:
     bool OpenDocument(std::wstring tab_title, const std::string& utf8_text, bool read_only);
 
     bool ActivateDocument(EditorDocumentId id);
+    // 请求关闭会经过未保存确认和控制器缓存流程；CloseDocument 只移除 UI。
+    void RequestCloseDocument(EditorDocumentId id);
     bool CloseDocument(EditorDocumentId id);
     bool SetDocumentContent(EditorDocumentId id,
                             std::string content,
@@ -140,12 +142,21 @@ public:
                             bool read_only,
                             bool dirty);
     void SetDocumentSaving(EditorDocumentId id, bool saving);
+    // 缓存关闭快照期间暂时只读，成功才移除标签；失败后恢复原编辑状态。
+    void SetDocumentClosing(EditorDocumentId id, bool closing);
+    // 保存/另存为完成时只更新文件身份，不重载正文或切换当前标签。
+    void SetDocumentLocation(EditorDocumentId id,
+                             std::wstring title,
+                             std::string server_id,
+                             std::wstring path);
     void MarkDocumentSaved(EditorDocumentId id);
     void SetDocumentConflict(EditorDocumentId id, std::wstring message);
     void ClearDocumentConflict(EditorDocumentId id);
 
     [[nodiscard]] std::optional<std::string> DocumentText(EditorDocumentId id);
+    [[nodiscard]] std::optional<EditorSaveRequest> DocumentSnapshot(EditorDocumentId id);
     [[nodiscard]] bool DocumentSaving(EditorDocumentId id) const noexcept;
+    [[nodiscard]] bool DocumentDirty(EditorDocumentId id) const noexcept;
     [[nodiscard]] std::optional<EditorDocumentId> active_document() const noexcept;
     [[nodiscard]] std::size_t document_count() const noexcept;
 

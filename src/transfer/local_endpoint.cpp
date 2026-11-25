@@ -175,9 +175,10 @@ FileStat make_stat(const std::filesystem::path& path) {
 
     const auto changed = std::filesystem::last_write_time(path, error);
     if (!error) {
+        // 使用固定纪元转换，不能用两次 now() 估算时钟偏移，否则同一文件的
+        // 连续 stat 会产生纳秒级抖动，被编辑器误判为外部修改。
         result.modified = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-            changed - std::filesystem::file_time_type::clock::now() +
-            std::chrono::system_clock::now());
+            std::chrono::clock_cast<std::chrono::system_clock>(changed));
     }
     return result;
 }
@@ -312,6 +313,21 @@ std::unique_ptr<IReadStream> LocalEndpoint::open_read(const FileUri& uri,
     return std::make_unique<LocalReadStream>(native_path(uri), offset);
 }
 
+bool LocalEndpoint::equivalent(const FileUri& left, const FileUri& right) {
+    if (!accepts(left) || !accepts(right))
+        return false;
+    std::error_code error;
+    const bool result = std::filesystem::equivalent(native_path(left), native_path(right), error);
+    if (error && error != std::errc::no_such_file_or_directory)
+        throw std::system_error(error, "Cannot compare local file identities");
+    return !error && result;
+}
+
+FileUri LocalEndpoint::canonical(const FileUri& uri) {
+    const auto utf8 = std::filesystem::weakly_canonical(native_path(uri)).u8string();
+    return FileUri::local(std::string(reinterpret_cast<const char*>(utf8.data()), utf8.size()));
+}
+
 std::unique_ptr<IWriteStream>
 LocalEndpoint::open_write(const FileUri& uri, const std::uint64_t offset, const bool truncate) {
     return std::make_unique<LocalWriteStream>(native_path(uri), offset, truncate);
@@ -320,12 +336,13 @@ LocalEndpoint::open_write(const FileUri& uri, const std::uint64_t offset, const 
 void LocalEndpoint::rename(const FileUri& from, const FileUri& to, const bool replace) {
     auto source = native_path(from);
     auto target = native_path(to);
-    if (replace && std::filesystem::exists(target)) {
-        std::filesystem::remove_all(target);
-    } else if (!replace && std::filesystem::exists(target)) {
-        throw std::runtime_error("Rename target already exists");
-    }
-    std::filesystem::rename(source, target);
+    // 替换由内核在同一次重命名中提交。源不存在、目标被占用或权限不足时，
+    // 原目标必须保持原样，绝不能先 remove_all 再尝试 rename。
+    if (!MoveFileExW(source.c_str(),
+                     target.c_str(),
+                     MOVEFILE_WRITE_THROUGH | (replace ? MOVEFILE_REPLACE_EXISTING : 0)))
+        throw std::system_error(
+            static_cast<int>(GetLastError()), std::system_category(), "Cannot rename local path");
 }
 
 void LocalEndpoint::remove(const FileUri& uri, const bool recursive) {
@@ -339,7 +356,7 @@ void LocalEndpoint::remove(const FileUri& uri, const bool recursive) {
 void LocalEndpoint::mkdir(const FileUri& uri, const bool recursive) {
     const bool created = recursive ? std::filesystem::create_directories(native_path(uri))
                                    : std::filesystem::create_directory(native_path(uri));
-    if (!created && !std::filesystem::is_directory(native_path(uri))) {
+    if (!created && (!recursive || !std::filesystem::is_directory(native_path(uri)))) {
         throw std::runtime_error("Cannot create local directory");
     }
 }

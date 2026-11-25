@@ -36,6 +36,7 @@ std::vector<DirectoryEntry> SftpEndpoint::list(const FileUri& directory) {
     auto result = adapter_->list(directory.path());
     // Adapters may leave URI construction to this endpoint.
     for (auto& entry : result) {
+        ValidateFileName(entry.name);
         entry.uri = directory.joined(entry.name);
     }
     return result;

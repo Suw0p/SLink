@@ -71,6 +71,13 @@ public:
     [[nodiscard]] virtual std::vector<DirectoryEntry> list(const FileUri& directory) = 0;
     [[nodiscard]] virtual FileStat stat(const FileUri& uri) = 0;
     [[nodiscard]] virtual bool exists(const FileUri& uri) = 0;
+    // 默认只能识别 URI 相等；本地端点额外比较文件身份以识别硬链接/目录别名。
+    [[nodiscard]] virtual bool equivalent(const FileUri& left, const FileUri& right) {
+        return left == right;
+    }
+    [[nodiscard]] virtual FileUri canonical(const FileUri& uri) {
+        return uri;
+    }
     [[nodiscard]] virtual std::unique_ptr<IReadStream> open_read(const FileUri& uri,
                                                                  std::uint64_t offset = 0) = 0;
     [[nodiscard]] virtual std::unique_ptr<IWriteStream>

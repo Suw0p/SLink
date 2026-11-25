@@ -81,12 +81,17 @@ struct KeyboardPrompt {
     bool echo{};
 };
 
-using KeyboardResponseCallback = std::function<Result<std::vector<std::string>>(
-    std::string_view name, std::string_view instruction, std::span<const KeyboardPrompt> prompts)>;
+using AuthenticationCancelled = std::function<bool()>;
+using KeyboardResponseCallback =
+    std::function<Result<std::vector<std::string>>(std::string_view name,
+                                                   std::string_view instruction,
+                                                   std::span<const KeyboardPrompt> prompts,
+                                                   const AuthenticationCancelled& cancelled)>;
 
 struct KeyboardInteractiveAuth {
     std::string username;
     KeyboardResponseCallback respond;
+    AuthenticationCancelled cancelled;
 };
 
 // 仅在会话所属线程、libssh2 返回 EAGAIN 后调用；Reactor 可注入 socket 轮询，

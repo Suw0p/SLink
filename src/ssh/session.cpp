@@ -416,7 +416,8 @@ public:
                              static_cast<std::size_t>(std::max(name_length, 0))),
             std::string_view(instruction != nullptr ? instruction : "",
                              static_cast<std::size_t>(std::max(instruction_length, 0))),
-            converted);
+            converted,
+            self->active_keyboard->cancelled);
         if (!result) {
             self->keyboard_error = result.status();
             return;
@@ -1213,6 +1214,7 @@ public:
             std::string filename(name.data(), static_cast<std::size_t>(read));
             if (filename == "." || filename == "..")
                 continue;
+            transfer::ValidateFileName(filename);
             result.push_back(
                 {filename,
                  transfer::FileUri::sftp(
@@ -1290,9 +1292,10 @@ public:
 
         // Servers without posix-rename@openssh.com may still implement the
         // standard rename request and honor libssh2's overwrite preference.
-        long flags = LIBSSH2_SFTP_RENAME_ATOMIC | LIBSSH2_SFTP_RENAME_NATIVE;
-        if (replace)
-            flags |= LIBSSH2_SFTP_RENAME_OVERWRITE;
+        // NATIVE/POSIX rename 可能替换目标，不能用于“不覆盖”的最终提交。
+        const long flags = replace ? LIBSSH2_SFTP_RENAME_ATOMIC | LIBSSH2_SFTP_RENAME_NATIVE |
+                                         LIBSSH2_SFTP_RENAME_OVERWRITE
+                                   : 0;
         const auto result = session_->impl_->retry([&] {
             return libssh2_sftp_rename_ex(sftp_,
                                           from.data(),

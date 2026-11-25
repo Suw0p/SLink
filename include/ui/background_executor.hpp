@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -12,30 +13,87 @@
 
 namespace SLink::ui::detail {
 
+// 提交、取消和异常都通过最后一个 ticket 的析构归还计数，不能依赖任务手工调用 End。
+class BackgroundActivity final {
+    struct State {
+        std::mutex mutex;
+        std::condition_variable idle;
+        std::size_t count{};
+    };
+    struct Ticket {
+        std::shared_ptr<State> state;
+        bool armed{};
+        ~Ticket() {
+            if (!armed)
+                return;
+            std::scoped_lock lock(state->mutex);
+            if (--state->count == 0)
+                state->idle.notify_all();
+        }
+    };
+    std::shared_ptr<State> state_ = std::make_shared<State>();
+
+public:
+    [[nodiscard]] std::shared_ptr<void> Track() {
+        auto ticket = std::make_shared<Ticket>();
+        ticket->state = state_;
+        std::scoped_lock lock(state_->mutex);
+        ++state_->count;
+        ticket->armed = true;
+        return ticket;
+    }
+    void WaitForIdle() const {
+        std::unique_lock lock(state_->mutex);
+        state_->idle.wait(lock, [&] {
+            return state_->count == 0;
+        });
+    }
+};
+
 // UI 页面共享的小型工作池，用于本地目录枚举、图标解析等短任务。析构时停止接收任务
 // 并清空尚未开始的队列。远程 libssh2 操作不得提交到这里。
 class BackgroundExecutor final {
 public:
-    explicit BackgroundExecutor(const std::size_t worker_count = 2) {
+    using ThreadFactory = std::function<std::jthread(std::function<void(std::stop_token)>)>;
+
+    explicit BackgroundExecutor(const std::size_t worker_count = 2, ThreadFactory factory = {}) {
         const std::size_t count = std::max<std::size_t>(1, worker_count);
         workers_.reserve(count);
-        for (std::size_t index = 0; index < count; ++index) {
-            workers_.emplace_back([this](const std::stop_token stop) {
-                Run(stop);
-            });
+        try {
+            for (std::size_t index = 0; index < count; ++index) {
+                auto action = [this](const std::stop_token stop) {
+                    Run(stop);
+                };
+                workers_.push_back(factory ? factory(action) : std::jthread(action));
+            }
+        } catch (...) {
+            // 构造失败不会进入类析构；已启动的线程也必须先唤醒再 join。
+            Stop();
+            throw;
         }
     }
 
     ~BackgroundExecutor() {
+        Stop();
+    }
+
+    void Stop() {
+        std::deque<std::function<void()>> cancelled;
         {
             std::scoped_lock lock(mutex_);
             stopping_ = true;
-            tasks_.clear();
+            cancelled.swap(tasks_);
         }
         for (auto& worker : workers_) {
             worker.request_stop();
         }
         changed_.notify_all();
+        // 先归还未开始任务的计数，再等待仍在执行的线程，不能倒过来互相等待。
+        cancelled.clear();
+        for (auto& worker : workers_)
+            if (worker.joinable())
+                worker.join();
+        // 任务捕获的端点/RAII 守卫可能阻塞或获取其他锁，在队列锁外析构。
     }
 
     BackgroundExecutor(const BackgroundExecutor&) = delete;

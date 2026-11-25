@@ -125,9 +125,36 @@ void validate_authority(std::string_view authority) {
 
 } // namespace
 
+void ValidateFileName(std::string_view name, const bool windows_target) {
+    if (name.empty() || name == "." || name == ".." ||
+        name.find_first_of("/\\") != std::string_view::npos || name.find('\0') != name.npos)
+        throw std::invalid_argument("Directory entry is not a single safe file name");
+    if (!windows_target)
+        return;
+    if (name.back() == '.' || name.back() == ' ' || name.find_first_of("<>:\"|?*") != name.npos ||
+        std::ranges::any_of(name, [](const unsigned char c) {
+            return c < 32;
+        }))
+        throw std::invalid_argument("File name is not supported by Windows");
+    std::string base(name.substr(0, name.find('.')));
+    while (!base.empty() && (base.back() == ' ' || base.back() == '.'))
+        base.pop_back();
+    std::ranges::transform(base, base.begin(), [](const unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    const bool port = base.starts_with("COM") || base.starts_with("LPT");
+    if (base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" ||
+        (port &&
+         ((base.size() == 4 && base[3] >= '1' && base[3] <= '9') || base.substr(3) == "\xC2\xB9" ||
+          base.substr(3) == "\xC2\xB2" || base.substr(3) == "\xC2\xB3")))
+        throw std::invalid_argument("Reserved Windows file name");
+}
+
 FileUri::FileUri(FileScheme scheme, std::string authority, std::string path)
     : scheme_(scheme), authority_(std::move(authority)),
       path_(normalize_path(path, scheme == FileScheme::Local)) {
+    if (path.find('\0') != std::string::npos)
+        throw std::invalid_argument("File path contains a NUL byte");
     if (scheme_ == FileScheme::Local) {
         if (!authority_.empty()) {
             throw std::invalid_argument("A local URI cannot have an authority");

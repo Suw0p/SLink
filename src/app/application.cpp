@@ -5,6 +5,7 @@
 #include "app/editor_controller.hpp"
 #include "app/file_session_controller.hpp"
 #include "app/firewall_helper.hpp"
+#include "app/interactive_auth.hpp"
 #include "app/port_forward_controller.hpp"
 #include "app/server_manager_dialog.hpp"
 #include "app/terminal_session_controller.hpp"
@@ -31,6 +32,7 @@
 #include "ui/win32_ui_internal.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <commctrl.h>
 #include <condition_variable>
@@ -233,9 +235,11 @@ public:
                                             std::wstring title,
                                             std::wstring prompt,
                                             bool password = true,
-                                            std::wstring initial_value = {}) {
+                                            std::wstring initial_value = {},
+                                            std::function<bool()> cancelled = {}) {
         SecurePrompt dialog(
             owner, std::move(title), std::move(prompt), password, std::move(initial_value));
+        dialog.cancelled_ = std::move(cancelled);
         return dialog.Run();
     }
 
@@ -268,6 +272,10 @@ private:
             return DefWindowProcW(window, message, wparam, lparam);
         }
         switch (message) {
+        case WM_TIMER:
+            if (self->cancelled_ && self->cancelled_())
+                self->Cancel();
+            return 0;
         case WM_DRAWITEM: {
             const auto* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(lparam);
             if (draw && ui::detail::DrawSelfDrawnButton(*draw, draw->CtlID == IDOK)) {
@@ -345,6 +353,8 @@ private:
     }
 
     std::optional<std::wstring> Run() {
+        if (cancelled_ && cancelled_())
+            return std::nullopt;
         const HINSTANCE instance = GetModuleHandleW(nullptr);
         if (!RegisterClass(instance)) {
             return std::nullopt;
@@ -432,6 +442,8 @@ private:
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
         SetFocus(edit_);
+        if (cancelled_)
+            SetTimer(window_, 1, 50, nullptr);
         MSG message{};
         while (!done_) {
             const BOOL result = GetMessageW(&message, nullptr, 0, 0);
@@ -447,6 +459,8 @@ private:
             }
         }
         EnableWindow(owner_, TRUE);
+        if (window_ && IsWindow(window_))
+            DestroyWindow(window_);
         SetForegroundWindow(owner_);
         if (!accepted_) {
             if (!value_.empty()) {
@@ -466,6 +480,7 @@ private:
     std::wstring value_;
     bool password_{true};
     bool accepted_{};
+    std::function<bool()> cancelled_;
     bool done_{};
 };
 
@@ -490,14 +505,6 @@ public:
 private:
     HRESULT result_{E_UNEXPECTED};
     bool initialized_{};
-};
-
-struct KeyboardResponseState {
-    std::mutex mutex;
-    std::condition_variable changed;
-    bool ready{};
-    std::optional<std::vector<std::string>> responses;
-    Status failure{ErrorCode::cancelled, L"用户取消了 keyboard-interactive 认证。"};
 };
 
 std::wstring FormatFileSize(const std::uint64_t bytes) {
@@ -582,6 +589,8 @@ struct Application::Impl {
     std::unique_ptr<storage::RotatingLog> log;
     std::unique_ptr<ui::MainWindow> main_window;
     std::shared_ptr<ssh::IUiDispatcher> ui_dispatcher;
+    std::shared_ptr<std::atomic_bool> authentication_stopping =
+        std::make_shared<std::atomic_bool>(false);
     std::unique_ptr<TerminalSessionController> terminal_sessions;
     std::unique_ptr<PortForwardController> port_forwards;
     std::unique_ptr<FirewallHelperClient> firewall_helper;
@@ -863,80 +872,83 @@ struct Application::Impl {
         const auto dispatcher = ui_dispatcher;
         const HWND owner = main_window ? main_window->hwnd() : nullptr;
         const std::wstring server_name = Utf8ToWide(profile.name);
-        return [dispatcher, owner, server_name](const std::string_view name,
-                                                const std::string_view instruction,
-                                                const std::span<const ssh::KeyboardPrompt> prompts)
-                   -> Result<std::vector<std::string>> {
-            if (!dispatcher || !IsWindow(owner)) {
-                return Status{ErrorCode::cancelled, L"keyboard-interactive 认证窗口已不可用。"};
-            }
-            auto state = std::make_shared<KeyboardResponseState>();
-            std::vector<ssh::KeyboardPrompt> prompt_copy(prompts.begin(), prompts.end());
-            const std::wstring title =
-                server_name.empty() ? L"SSH keyboard-interactive" : L"认证 " + server_name;
-            const std::wstring name_text = Utf8ToWide(name);
-            const std::wstring instruction_text = Utf8ToWide(instruction);
-            try {
-                dispatcher->post([state,
-                                  owner,
-                                  title,
-                                  name_text,
-                                  instruction_text,
-                                  prompt_copy = std::move(prompt_copy)]() mutable {
-                    std::vector<std::string> responses;
-                    responses.reserve(prompt_copy.size());
-                    Status failure = Status::ok();
-                    for (const auto& prompt : prompt_copy) {
-                        std::wstring description;
-                        if (!name_text.empty()) {
-                            description += name_text + L"\r\n";
-                        }
-                        if (!instruction_text.empty()) {
-                            description += instruction_text + L"\r\n";
-                        }
-                        description += Utf8ToWide(prompt.text);
-                        auto value =
-                            SecurePrompt::Show(owner, title, std::move(description), !prompt.echo);
-                        if (!value) {
-                            failure = {ErrorCode::cancelled,
-                                       L"用户取消了 keyboard-interactive "
-                                       L"认证。"};
-                            break;
-                        }
-                        responses.push_back(WideToUtf8(*value));
-                        if (!value->empty()) {
-                            SecureZeroMemory(value->data(), value->size() * sizeof(wchar_t));
-                        }
-                    }
-                    {
-                        std::scoped_lock lock(state->mutex);
-                        if (failure) {
-                            state->responses = std::move(responses);
-                        } else {
-                            for (auto& response : responses) {
-                                if (!response.empty()) {
-                                    SecureZeroMemory(response.data(), response.size());
-                                }
+        return
+            [dispatcher, owner, server_name, stopping = authentication_stopping](
+                const std::string_view name,
+                const std::string_view instruction,
+                const std::span<const ssh::KeyboardPrompt> prompts,
+                const ssh::AuthenticationCancelled& cancelled) -> Result<std::vector<std::string>> {
+                const auto cancel = [stopping, cancelled] {
+                    return stopping->load(std::memory_order_acquire) || (cancelled && cancelled());
+                };
+                if (!dispatcher || !IsWindow(owner) || cancel()) {
+                    return Status{ErrorCode::cancelled, L"keyboard-interactive 认证窗口已不可用。"};
+                }
+                auto state = std::make_shared<InteractiveAuthRequest>();
+                std::vector<ssh::KeyboardPrompt> prompt_copy(prompts.begin(), prompts.end());
+                const std::wstring title =
+                    server_name.empty() ? L"SSH keyboard-interactive" : L"认证 " + server_name;
+                const std::wstring name_text = Utf8ToWide(name);
+                const std::wstring instruction_text = Utf8ToWide(instruction);
+                try {
+                    dispatcher->post([state,
+                                      owner,
+                                      title,
+                                      name_text,
+                                      instruction_text,
+                                      cancel,
+                                      prompt_copy = std::move(prompt_copy)]() mutable {
+                        std::vector<std::string> responses;
+                        responses.reserve(prompt_copy.size());
+                        Status failure = Status::ok();
+                        for (const auto& prompt : prompt_copy) {
+                            if (cancel() || state->abandoned() || !IsWindow(owner)) {
+                                failure = {ErrorCode::cancelled, L"交互认证已取消。"};
+                                break;
                             }
-                            state->failure = std::move(failure);
+                            std::wstring description;
+                            if (!name_text.empty()) {
+                                description += name_text + L"\r\n";
+                            }
+                            if (!instruction_text.empty()) {
+                                description += instruction_text + L"\r\n";
+                            }
+                            description += Utf8ToWide(prompt.text);
+                            auto value =
+                                SecurePrompt::Show(owner,
+                                                   title,
+                                                   std::move(description),
+                                                   !prompt.echo,
+                                                   {},
+                                                   [state, cancel] {
+                                                       return cancel() || state->abandoned();
+                                                   });
+                            if (!value) {
+                                failure = {ErrorCode::cancelled,
+                                           L"用户取消了 keyboard-interactive "
+                                           L"认证。"};
+                                break;
+                            }
+                            responses.push_back(WideToUtf8(*value));
+                            if (!value->empty()) {
+                                SecureZeroMemory(value->data(), value->size() * sizeof(wchar_t));
+                            }
                         }
-                        state->ready = true;
-                    }
-                    state->changed.notify_all();
-                });
-            } catch (...) {
-                return Status{ErrorCode::io_error, L"无法调度 keyboard-interactive 认证窗口。"};
-            }
+                        if (failure)
+                            state->Complete(std::move(responses));
+                        else {
+                            for (auto& response : responses)
+                                if (!response.empty())
+                                    SecureZeroMemory(response.data(), response.size());
+                            state->Complete(std::move(failure));
+                        }
+                    });
+                } catch (...) {
+                    return Status{ErrorCode::io_error, L"无法调度 keyboard-interactive 认证窗口。"};
+                }
 
-            std::unique_lock lock(state->mutex);
-            state->changed.wait(lock, [&state] {
-                return state->ready;
-            });
-            if (!state->responses) {
-                return state->failure;
-            }
-            return std::move(*state->responses);
-        };
+                return state->Wait(cancel);
+            };
     }
 
     Result<TerminalAuthentication> AuthenticationFor(const storage::ServerProfile& profile) {
@@ -1001,7 +1013,12 @@ struct Application::Impl {
             main_window->hwnd(),
             L"连接 " + Utf8ToWide(profile.name),
             L"请输入 " + Utf8ToWide(profile.username) + L"@" + Utf8ToWide(profile.host) +
-                L" 的 SSH 密码。\r\n此密码仅用于本次连接，不会保存。");
+                L" 的 SSH 密码。\r\n此密码仅用于本次连接，不会保存。",
+            true,
+            {},
+            [stopping = authentication_stopping] {
+                return stopping->load(std::memory_order_acquire);
+            });
         if (!password) {
             return Status{ErrorCode::cancelled, L"用户取消了密码输入。"};
         }
@@ -1967,7 +1984,8 @@ struct Application::Impl {
     }
 
     void StopFileProducers() {
-        if (main_window) main_window->transfer_page().ShutdownShellDrags();
+        if (main_window)
+            main_window->transfer_page().ShutdownShellDrags();
         // 先停止会产生新文件/SFTP 工作的上层对象。EditorController 先停止编辑线程，
         // TransferManager 随后等待全部传输工作线程退出，连接池此后不会再收到新租约。
         local_editor_directory_executor.reset();
@@ -2063,6 +2081,8 @@ struct Application::Impl {
     }
 
     void Shutdown() {
+        // 必须先唤醒等待 UI 的认证任务，再 join 任何业务/Reactor 线程。
+        authentication_stopping->store(true, std::memory_order_release);
         // 退出协调只表达依赖顺序：先停生产者，再关文件会话、代理和终端，最后刷库。
         if (log) {
             (void)log->Write(storage::LogLevel::Info, "SLink shutdown");
@@ -2530,6 +2550,9 @@ int Application::Run(HINSTANCE instance, int show_command) {
                                            [application_state](const transfer::FileUri& uri) {
                                                return application_state->EndpointFor(uri);
                                            });
+    impl_->main_window->SetCloseRequestCallback([application_state](auto completed) {
+        application_state->editor_controller->PrepareForShutdown(std::move(completed));
+    });
     impl_->editor_controller->SetFileActivationResolver(
         [application_state](
             const ui::EditorFileActivation& activation) -> std::optional<transfer::FileUri> {

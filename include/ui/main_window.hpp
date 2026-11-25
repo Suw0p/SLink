@@ -56,12 +56,13 @@ public:
     MainPage active_page() const noexcept;
     void ShowPage(MainPage page);
     void SetServerManagerCallback(std::function<void()> callback);
+    // UI 线程异步关闭检查；completed(false) 保留窗口，true 才结束消息循环。
+    void SetCloseRequestCallback(std::function<void(std::function<void(bool)>)> callback);
     void SetServerSidebarItems(std::vector<ServerSidebarGroup> groups,
                                std::vector<ServerSidebarItem> servers);
     void SetCollapsedServerGroups(std::vector<std::string> group_ids,
                                   std::function<bool(const std::vector<std::string>&)> changed);
-    void SetServerUngroupedPreference(bool ungrouped,
-                                      std::function<bool(bool)> changed_callback);
+    void SetServerUngroupedPreference(bool ungrouped, std::function<bool(bool)> changed_callback);
     bool SelectServerSidebarItem(std::string_view server_id);
     void SetThemePreference(theme::Mode selected,
                             std::function<bool(theme::Mode)> changed_callback);

@@ -446,8 +446,7 @@ struct TransferPage::Impl {
 
     struct AsyncLifetime {
         std::mutex mutex;
-        std::condition_variable idle;
-        std::size_t active_jobs{};
+        detail::BackgroundActivity activity;
         bool alive{true};
         HWND window{};
     };
@@ -1046,10 +1045,8 @@ struct TransferPage::Impl {
             std::unique_lock lock(async_lifetime->mutex);
             async_lifetime->alive = false;
             async_lifetime->window = nullptr;
-            async_lifetime->idle.wait(lock, [this] {
-                return async_lifetime->active_jobs == 0;
-            });
         }
+        async_lifetime->activity.WaitForIdle();
         MSG pending{};
         while (PeekMessageW(
             &pending, window, kDirectoryResultMessage, kDirectoryResultMessage, PM_REMOVE)) {
@@ -2356,7 +2353,8 @@ struct TransferPage::Impl {
         const auto result = shell_drag.Run({drag_uris, drag_directory_uris});
         shell_drag_active = false;
         CancelInternalDrag();
-        if (FAILED(result)) Report(L"无法拖出文件，请检查文件名、连接状态或系统资源");
+        if (FAILED(result))
+            Report(L"无法拖出文件，请检查文件名、连接状态或系统资源");
     }
 
     void CancelInternalDrag() {
@@ -3233,16 +3231,21 @@ struct TransferPage::Impl {
         const auto pane_id = pane.id;
         const auto receive_drop =
             [this, pane_id](const detail::ShellFileSelection& selection, POINT point, bool drop) {
-                if (!FindPane(pane_id)) return false;
+                if (!FindPane(pane_id))
+                    return false;
                 drag_uris = selection.sources;
                 drag_directory_uris = selection.directories;
                 UpdateInternalDragTarget(point);
                 const bool allowed = drag_drop_allowed && drag_target_pane_id == pane_id;
-                if (drop && allowed) CompleteInternalDrag(point);
+                if (drop && allowed)
+                    CompleteInternalDrag(point);
                 return allowed;
             };
-        const auto leave_drop = [this] { ClearInternalDragTarget(); };
-        const HRESULT drop_registered = shell_drag.RegisterTarget(pane.list, receive_drop, leave_drop);
+        const auto leave_drop = [this] {
+            ClearInternalDragTarget();
+        };
+        const HRESULT drop_registered =
+            shell_drag.RegisterTarget(pane.list, receive_drop, leave_drop);
         (void)shell_drag.RegisterTarget(pane.container, receive_drop, leave_drop);
         // OLE 未初始化时保留原有系统文件拖入兼容路径。
         DragAcceptFiles(pane.list, FAILED(drop_registered));
@@ -3407,29 +3410,19 @@ struct TransferPage::Impl {
         }
     }
 
-    static std::shared_ptr<AsyncLifetime> BeginAsyncWork(const std::weak_ptr<AsyncLifetime>& weak) {
-        const auto lifetime = weak.lock();
-        if (!lifetime) {
+    static std::shared_ptr<void> BeginAsyncWork(const std::weak_ptr<AsyncLifetime>& weak) noexcept {
+        try {
+            const auto lifetime = weak.lock();
+            if (!lifetime) {
+                return {};
+            }
+            std::scoped_lock lock(lifetime->mutex);
+            if (!lifetime->alive) {
+                return {};
+            }
+            return lifetime->activity.Track();
+        } catch (...) {
             return {};
-        }
-        std::scoped_lock lock(lifetime->mutex);
-        if (!lifetime->alive) {
-            return {};
-        }
-        ++lifetime->active_jobs;
-        return lifetime;
-    }
-
-    static void EndAsyncWork(const std::shared_ptr<AsyncLifetime>& lifetime) {
-        if (!lifetime) {
-            return;
-        }
-        std::scoped_lock lock(lifetime->mutex);
-        if (lifetime->active_jobs != 0) {
-            --lifetime->active_jobs;
-        }
-        if (lifetime->active_jobs == 0) {
-            lifetime->idle.notify_all();
         }
     }
 
@@ -3471,17 +3464,13 @@ struct TransferPage::Impl {
                         result->error = L"文件操作发生未知错误";
                     }
                     PostMutationResult(weak, std::move(result));
-                    EndAsyncWork(work);
                 });
             if (!submitted) {
-                EndAsyncWork(work);
                 Report(L"文件操作后台执行器已停止");
             }
         } catch (const std::exception& error) {
-            EndAsyncWork(work);
             Report(ExceptionText(error));
         } catch (...) {
-            EndAsyncWork(work);
             Report(L"无法启动文件操作任务");
         }
     }
@@ -3570,11 +3559,8 @@ struct TransferPage::Impl {
                                 }
                             }
                             PostDirectoryResult(weak, std::move(result));
-                            EndAsyncWork(work);
                         });
-                    if (!submitted) {
-                        EndAsyncWork(work);
-                    }
+                    (void)submitted;
                 } catch (const std::exception& thread_error) {
                     auto result = std::make_unique<DirectoryResult>();
                     result->pane_id = pane_id;
@@ -3582,7 +3568,6 @@ struct TransferPage::Impl {
                     result->location = location;
                     result->error = ExceptionText(thread_error);
                     PostDirectoryResult(weak, std::move(result));
-                    EndAsyncWork(work);
                 } catch (...) {
                     auto result = std::make_unique<DirectoryResult>();
                     result->pane_id = pane_id;
@@ -3590,7 +3575,6 @@ struct TransferPage::Impl {
                     result->location = location;
                     result->error = L"无法启动目录结果处理任务";
                     PostDirectoryResult(weak, std::move(result));
-                    EndAsyncWork(work);
                 }
             };
 
@@ -3633,16 +3617,13 @@ struct TransferPage::Impl {
                         result->error = L"读取目录时发生未知错误";
                     }
                     PostDirectoryResult(weak, std::move(result));
-                    EndAsyncWork(work);
                 });
             if (!submitted) {
-                EndAsyncWork(work);
                 pane.loading = false;
                 Report(L"目录后台执行器已停止");
                 return false;
             }
         } catch (...) {
-            EndAsyncWork(work);
             pane.loading = false;
             Report(L"无法启动本地目录加载任务");
             return false;

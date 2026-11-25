@@ -280,8 +280,7 @@ void UiSurface::Paint(const D2D1_COLOR_F clear_color) {
             DrawElement(element);
         }
     }
-    if (overlay_accent_ && Width(*overlay_accent_) > 0.0F &&
-        Height(*overlay_accent_) > 0.0F) {
+    if (overlay_accent_ && Width(*overlay_accent_) > 0.0F && Height(*overlay_accent_) > 0.0F) {
         target_->FillRoundedRectangle(D2D1::RoundedRect(*overlay_accent_, 1.0F, 1.0F),
                                       Brush(ThemeColor(theme::kAccentColor)));
     }
@@ -471,7 +470,7 @@ void UiSurface::DrawElement(const UiElement& element) {
     } else {
         content.left += padding;
     }
-    content.right -= padding;
+    content.right -= padding + element.text_right_inset;
     if (!element.text.empty()) {
         DrawText(element, content, Brush(text_color));
     }

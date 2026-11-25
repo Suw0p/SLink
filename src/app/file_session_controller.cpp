@@ -142,9 +142,10 @@ bool AuthenticationMatches(storage::AuthenticationKind kind,
 
 Status Authenticate(ssh::SshSession& session,
                     const storage::ServerProfile& profile,
-                    FileSessionAuthentication& authentication) {
+                    FileSessionAuthentication& authentication,
+                    const ssh::CancellationToken& cancellation) {
     return std::visit(
-        [&session, &profile](auto& value) -> Status {
+        [&session, &profile, &cancellation](auto& value) -> Status {
             using Authentication = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<Authentication, FilePasswordAuthentication>) {
                 SensitiveString password(value.password);
@@ -172,7 +173,9 @@ Status Authenticate(ssh::SshSession& session,
                             L"pre-collected responses."};
                 }
                 return session.authenticate(
-                    ssh::KeyboardInteractiveAuth{profile.username, value.respond});
+                    ssh::KeyboardInteractiveAuth{profile.username, value.respond, [cancellation] {
+                                                     return cancellation.is_cancelled();
+                                                 }});
             }
         },
         authentication);
@@ -966,7 +969,8 @@ struct FileSessionController::Impl {
         if (cancellation.is_cancelled()) {
             return CancelledStatus();
         }
-        if (auto status = Authenticate(*session, record->profile, *authentication); !status) {
+        if (auto status = Authenticate(*session, record->profile, *authentication, cancellation);
+            !status) {
             return status;
         }
         if (auto status = session->configure_keepalive(kKeepaliveInterval, true); !status) {

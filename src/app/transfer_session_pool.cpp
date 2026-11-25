@@ -96,14 +96,25 @@ struct TransferSessionPool::State final
             const auto locked = state.lock();
             if (!locked || !slot)
                 return;
+            std::shared_ptr<transfer::IFileEndpoint> endpoint;
+            bool check_health{};
+            {
+                std::scoped_lock guard(locked->mutex);
+                const auto found = locked->servers.find(server_id);
+                endpoint = slot->endpoint;
+                check_health = !slot->close_on_release && !locked->stopping &&
+                               found != locked->servers.end() && !found->second.closing;
+            }
+            // available() 可能封送到 Reactor 等待，绝不能在连接池全局锁内调用。
+            const bool healthy = check_health && endpoint && endpoint->available();
             std::shared_ptr<transfer::IFileEndpoint> close;
             {
                 std::scoped_lock guard(locked->mutex);
                 const auto found = locked->servers.find(server_id);
                 slot->leased = false;
                 slot->idle_since = std::chrono::steady_clock::now();
-                if (slot->close_on_release || !slot->endpoint || !slot->endpoint->available() ||
-                    locked->stopping || found == locked->servers.end() || found->second.closing) {
+                if (slot->close_on_release || !healthy || locked->stopping ||
+                    found == locked->servers.end() || found->second.closing) {
                     close = std::move(slot->endpoint);
                     if (found != locked->servers.end()) {
                         std::erase(found->second.slots, slot);
@@ -123,11 +134,12 @@ struct TransferSessionPool::State final
     lease_locked(const std::string& server_id, const std::shared_ptr<ConnectionSlot>& slot) {
         // 返回指向 endpoint 的别名 shared_ptr，同时以 LeaseOwner 作为真实控制块。
         // 调用方因此只能通过正常释放 shared_ptr 归还连接，不会忘记手工 unlock。
-        slot->leased = true;
         auto owner = std::make_shared<LeaseOwner>();
         owner->state = weak_from_this();
         owner->server_id = server_id;
         owner->slot = slot;
+        // 所有可能抛异常的分配均完成后才提交占用标记，失败不会永久吃掉一个槽位。
+        slot->leased = true;
         return std::shared_ptr<transfer::IFileEndpoint>(owner, slot->endpoint.get());
     }
 
@@ -136,10 +148,10 @@ struct TransferSessionPool::State final
             return;
         if (maintenance.joinable())
             maintenance.join();
-        maintenance_running = true;
         maintenance = std::thread([this] {
             maintenance_loop();
         });
+        maintenance_running = true;
     }
 
     void maintenance_loop() noexcept {
@@ -160,18 +172,18 @@ struct TransferSessionPool::State final
                 std::erase_if(slots, [&close, &keepalive, now](const auto& slot) {
                     if (!slot->endpoint)
                         return true;
+                    if (!slot->leased &&
+                        slot->idle_since != std::chrono::steady_clock::time_point{} &&
+                        now - slot->idle_since >= 120s) {
+                        close.push_back(std::move(slot->endpoint));
+                        return true;
+                    }
                     if (slot->last_keepalive == std::chrono::steady_clock::time_point{} ||
                         now - slot->last_keepalive >= 60s) {
                         slot->last_keepalive = now;
                         keepalive.emplace_back(slot, slot->endpoint);
                     }
-                    if (slot->leased ||
-                        slot->idle_since == std::chrono::steady_clock::time_point{} ||
-                        now - slot->idle_since < 120s) {
-                        return false;
-                    }
-                    close.push_back(std::move(slot->endpoint));
-                    return true;
+                    return false;
                 });
                 if (slots.empty() && !pool->second.connecting && pool->second.waiters == 0) {
                     pool = servers.erase(pool);
@@ -202,6 +214,11 @@ struct TransferSessionPool::State final
                     lock.lock();
                 }
             }
+            // keepalive 也持有端点；它可能是最后一份引用，必须在锁外释放。
+            lock.unlock();
+            keepalive.clear();
+            close.clear();
+            lock.lock();
             if (servers.empty())
                 break;
         }
@@ -217,24 +234,30 @@ struct TransferSessionPool::State final
             throw std::invalid_argument("TransferSessionPool only accepts sftp:// URIs");
         }
         const std::string server_id(uri.authority());
+        // 先声明所有权再声明锁：异常展开时先解锁，再析构可能等待 Reactor 的新端点。
+        std::shared_ptr<ConnectionSlot> pending_connection;
         std::unique_lock lock(mutex);
         auto& initial = servers[server_id];
         if (initial.closing)
             initial.closing = false;
-        ++initial.waiters;
         struct WaiterGuard final {
             State& state;
             std::string server_id;
+            std::unique_lock<std::mutex>& lock;
             bool active{true};
             ~WaiterGuard() {
                 if (!active)
                     return;
+                if (!lock.owns_lock())
+                    lock.lock();
                 const auto found = state.servers.find(server_id);
                 if (found != state.servers.end() && found->second.waiters != 0) {
                     --found->second.waiters;
                 }
             }
-        } waiter{*this, server_id};
+        } waiter{*this, server_id, lock, false};
+        ++initial.waiters;
+        waiter.active = true;
 
         for (;;) {
             // 步骤 2：每轮先淘汰不可用的空闲端点，再优先复用健康连接。端点析构可能
@@ -249,43 +272,90 @@ struct TransferSessionPool::State final
             }
             auto& pool = found->second;
             pool.closing = false;
-            std::vector<std::shared_ptr<transfer::IFileEndpoint>> stale;
-            std::erase_if(pool.slots, [&stale](const auto& slot) {
-                if (slot->leased || (slot->endpoint && slot->endpoint->available())) {
-                    return false;
-                }
-                if (slot->endpoint) {
-                    stale.push_back(std::move(slot->endpoint));
-                }
-                return true;
+            std::erase_if(pool.slots, [](const auto& slot) {
+                return !slot->endpoint;
             });
-            if (!stale.empty()) {
-                lock.unlock();
-                stale.clear();
-                lock.lock();
-                continue;
-            }
+            bool rejected_idle{};
             for (const auto& slot : pool.slots) {
-                if (!slot->leased && slot->endpoint && slot->endpoint->available()) {
-                    --pool.waiters;
-                    waiter.active = false;
-                    return lease_locked(server_id, slot);
+                if (!slot->leased && slot->endpoint) {
+                    // 临时租约负责预留槽位和异常回滚，健康检查在锁外执行。
+                    auto lease = lease_locked(server_id, slot);
+                    const auto candidate = slot;
+                    lock.unlock();
+                    const bool healthy = lease->available();
+                    lock.lock();
+                    if (healthy && !candidate->close_on_release && !stopping &&
+                        !(cancellation && cancellation->load(std::memory_order_acquire))) {
+                        auto current = servers.find(server_id);
+                        if (current != servers.end())
+                            --current->second.waiters;
+                        waiter.active = false;
+                        return lease;
+                    }
+                    candidate->close_on_release =
+                        candidate->close_on_release || !healthy || stopping;
+                    lock.unlock();
+                    lease.reset();
+                    lock.lock();
+                    // pool 的引用在解锁后可能失效，必须重新查找，不继续遍历。
+                    rejected_idle = true;
+                    break;
                 }
             }
+            if (rejected_idle)
+                continue;
+            // 上面的预留/淘汰可能修改了 slots，统一重新取得池引用。
+            found = servers.find(server_id);
+            if (found == servers.end())
+                continue;
+            auto& available_pool = found->second;
 
             // 步骤 3：没有空闲连接时按“现有连接 + 等待者”计算目标规模，且每台服务器
             // 同时只允许一个建连操作，最大不超过 4，避免并发认证风暴。
-            const std::size_t desired =
-                std::min(kMaximumConnectionsPerServer, pool.slots.size() + pool.waiters);
+            const std::size_t desired = std::min(
+                kMaximumConnectionsPerServer, available_pool.slots.size() + available_pool.waiters);
             const auto now = std::chrono::steady_clock::now();
-            if (!pool.connecting && pool.slots.size() < desired && now >= pool.retry_after) {
-                pool.connecting = true;
+            if (!available_pool.connecting && available_pool.slots.size() < desired &&
+                now >= available_pool.retry_after) {
+                struct ConnectAttempt {
+                    State& state;
+                    const std::string& id;
+                    std::unique_lock<std::mutex>& lock;
+                    bool active{true};
+                    ~ConnectAttempt() {
+                        if (!active)
+                            return;
+                        if (!lock.owns_lock())
+                            lock.lock();
+                        const auto found = state.servers.find(id);
+                        if (found != state.servers.end())
+                            found->second.connecting = false;
+                        state.changed.notify_all();
+                    }
+                } attempt{*this, server_id, lock};
+                available_pool.connecting = true;
                 lock.unlock();
                 Result<std::shared_ptr<transfer::IFileEndpoint>> opened =
                     Status{ErrorCode::io_error, L"无法创建传输专用 SFTP 连接。"};
                 try {
                     opened = factory(server_id);
                 } catch (...) {}
+                if (opened) {
+                    try {
+                        pending_connection = std::make_shared<ConnectionSlot>();
+                        pending_connection->endpoint = std::move(opened).value();
+                        pending_connection->last_keepalive = std::chrono::steady_clock::now();
+                    } catch (...) {
+                        lock.lock();
+                        const auto current = servers.find(server_id);
+                        if (current != servers.end())
+                            current->second.connecting = false;
+                        changed.notify_all();
+                        // opened 仍可能持有端点，必须先解锁再让它退出作用域。
+                        lock.unlock();
+                        throw;
+                    }
+                }
                 lock.lock();
                 auto current = servers.find(server_id);
                 if (current == servers.end()) {
@@ -293,6 +363,7 @@ struct TransferSessionPool::State final
                     current->second.waiters = 1;
                 }
                 current->second.connecting = false;
+                attempt.active = false;
                 if (!opened) {
                     // 网络/协议错误按 1、2、5、10、30 秒退避；认证和主机密钥错误直接
                     // 返回，不进行无意义重试或重复提示用户。
@@ -315,27 +386,33 @@ struct TransferSessionPool::State final
                 }
                 current->second.connection_failures = 0;
                 current->second.retry_after = {};
-                auto slot = std::make_shared<ConnectionSlot>();
-                slot->endpoint = std::move(opened).value();
-                slot->last_keepalive = std::chrono::steady_clock::now();
                 if (stopping || current->second.closing) {
-                    auto close = std::move(slot->endpoint);
                     if (current->second.waiters != 0) {
                         --current->second.waiters;
                     }
                     waiter.active = false;
                     lock.unlock();
-                    close.reset();
+                    pending_connection.reset();
                     throw std::runtime_error("SFTP transfer pool is closing");
                 }
-                current->second.slots.push_back(slot);
                 // 步骤 4：新连接先进入池，再启动维护线程并立即以 RAII 租约返回。
                 // 维护线程负责 60 秒保活和 120 秒空闲回收。
                 ensure_maintenance_locked();
+                // 先构造租约，再提交到池。若 push_back 失败，锁外释放租约以免重入池锁。
+                auto lease = lease_locked(server_id, pending_connection);
+                try {
+                    current->second.slots.push_back(pending_connection);
+                } catch (...) {
+                    pending_connection->close_on_release = true;
+                    lock.unlock();
+                    lease.reset();
+                    lock.lock();
+                    throw;
+                }
                 --current->second.waiters;
                 waiter.active = false;
                 changed.notify_all();
-                return lease_locked(server_id, slot);
+                return lease;
             }
             changed.wait_for(lock, 100ms);
         }

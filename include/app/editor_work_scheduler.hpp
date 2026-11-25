@@ -22,8 +22,15 @@ public:
 
     void
     Enqueue(std::string lane, std::function<void()> action, std::chrono::milliseconds delay = {});
+    // 同一 key 只保留最新一个未执行任务，用于逐文档缓存防抖，不影响普通保存任务顺序。
+    void EnqueueLatest(std::string lane,
+                       std::string key,
+                       std::function<void()> action,
+                       std::chrono::milliseconds delay = {});
+    void CancelLatest(const std::string& key);
     void Stop();
     [[nodiscard]] std::size_t worker_count() const noexcept;
+    [[nodiscard]] std::size_t pending_count() const;
 
 private:
     struct Impl;

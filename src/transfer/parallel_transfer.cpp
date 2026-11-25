@@ -11,6 +11,8 @@
 #include <deque>
 #include <limits>
 #include <mutex>
+#include <random>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -198,6 +200,29 @@ std::array<std::uint8_t, 32> digest(IFileEndpoint& endpoint,
     return hash.finish();
 }
 
+// 续传前只读取已有长度，不能仅凭大小认定残留文件属于当前源文件。
+// 校验期间不打开写流，前缀不一致或读取失败时保持目标原样，交给用户选择覆盖。
+template <typename Checkpoint>
+std::array<std::uint8_t, 32> prefix_digest(IFileEndpoint& endpoint,
+                                           const FileUri& uri,
+                                           std::uint64_t length,
+                                           Checkpoint checkpoint) {
+    Sha256 hash;
+    auto input = endpoint.open_read(uri);
+    std::vector<std::byte> buffer(128 * 1024);
+    while (length != 0) {
+        checkpoint();
+        const auto available =
+            static_cast<std::size_t>((std::min)(length, static_cast<std::uint64_t>(buffer.size())));
+        const auto count = input->read(std::span<std::byte>(buffer).first(available));
+        if (count == 0 || count > available)
+            throw std::runtime_error("Resume prefix changed or returned an invalid read length");
+        hash.update(std::span<const std::byte>(buffer.data(), count));
+        length -= count;
+    }
+    return hash.finish();
+}
+
 FileUri auto_rename(IFileEndpoint& endpoint, const FileUri& target) {
     const auto name = target.filename();
     const auto dot = name.find_last_of('.');
@@ -210,6 +235,15 @@ FileUri auto_rename(IFileEndpoint& endpoint, const FileUri& target) {
             return candidate;
     }
     throw std::runtime_error("Cannot find a free auto-rename target");
+}
+
+FileUri temporary_transfer_file(const FileUri& target) {
+    static std::atomic<std::uint64_t> sequence{};
+    std::random_device random;
+    std::ostringstream name;
+    name << ".SLink-transfer-" << std::hex << random() << random() << '-'
+         << sequence.fetch_add(1, std::memory_order_relaxed) << ".tmp";
+    return target.parent().joined(name.str());
 }
 
 } // namespace
@@ -234,9 +268,15 @@ public:
     };
 
     struct DirectoryFinalize {
+        FileUri source;
         FileUri target;
         std::uint32_t permissions{};
         std::size_t detail{kNoDetail};
+    };
+
+    struct CompletedFile {
+        FileWork work;
+        FileUri target;
     };
 
     struct Control {
@@ -263,6 +303,7 @@ public:
         std::chrono::steady_clock::time_point last_discovery_notification{};
         std::deque<FileWork> ready_files;
         std::vector<DirectoryFinalize> directories;
+        std::vector<CompletedFile> copied_files;
         std::vector<TransferItemProgress> details;
         std::deque<DetailChange> detail_changes;
         std::uint64_t detail_revision{};
@@ -393,6 +434,7 @@ public:
     void reset_details_locked(const std::shared_ptr<Control>& control) {
         control->ready_files.clear();
         control->directories.clear();
+        control->copied_files.clear();
         control->details.clear();
         control->detail_changes.clear();
         control->discovery_started = false;
@@ -679,6 +721,11 @@ public:
             metadata = metadata_hint ? *metadata_hint : source_endpoint->stat(source);
             if (metadata.kind == FileKind::Directory) {
                 entries = source_endpoint->list(source);
+                for (const auto& entry : entries) {
+                    ValidateFileName(entry.name, target.is_local());
+                    if (entry.uri != source.joined(entry.name))
+                        throw std::runtime_error("Directory entry escaped its source directory");
+                }
             }
         }
         if (metadata.kind != FileKind::Directory) {
@@ -692,7 +739,32 @@ public:
         FileUri actual_target = target;
         {
             auto target_endpoint = resolve_endpoint(control, actual_target);
-            if (target_endpoint->exists(actual_target)) {
+            if (!root) {
+                const auto boundary = target_endpoint->canonical(control->job.effective_target);
+                const auto resolved = target_endpoint->canonical(actual_target);
+                if (!target_is_descendant(boundary, resolved))
+                    throw std::runtime_error("Target directory escaped its transfer root");
+            }
+            if (root && control->job.spec.conflict == ConflictPolicy::AutoRename) {
+                if (!target_endpoint->exists(target.parent()))
+                    target_endpoint->mkdir(target.parent(), true);
+                for (;;) {
+                    checkpoint(control);
+                    if (target_endpoint->exists(actual_target))
+                        actual_target = auto_rename(*target_endpoint, target);
+                    try {
+                        target_endpoint->mkdir(actual_target, false);
+                        break;
+                    } catch (...) {
+                        if (!target_endpoint->exists(actual_target))
+                            throw;
+                        actual_target = auto_rename(*target_endpoint, target);
+                    }
+                }
+                set_detail_target(control, detail, actual_target);
+                std::scoped_lock lock(mutex);
+                control->job.effective_target = actual_target;
+            } else if (target_endpoint->exists(actual_target)) {
                 if (root && control->job.spec.conflict == ConflictPolicy::Skip) {
                     std::scoped_lock lock(mutex);
                     control->job.skipped = true;
@@ -701,13 +773,7 @@ public:
                     set_detail_state_locked(control, detail, TransferState::Completed);
                     return actual_target;
                 }
-                if (root && control->job.spec.conflict == ConflictPolicy::AutoRename) {
-                    actual_target = auto_rename(*target_endpoint, actual_target);
-                    set_detail_target(control, detail, actual_target);
-                    std::scoped_lock lock(mutex);
-                    control->job.effective_target = actual_target;
-                    target_endpoint->mkdir(actual_target, true);
-                } else if (target_endpoint->stat(actual_target).kind != FileKind::Directory) {
+                if (target_endpoint->stat(actual_target).kind != FileKind::Directory) {
                     if (control->job.spec.conflict != ConflictPolicy::Overwrite) {
                         throw std::runtime_error("Directory target conflicts with a file");
                     }
@@ -722,7 +788,7 @@ public:
         {
             std::scoped_lock lock(mutex);
             // 目录权限恢复属于正确性数据，不能和仅供 UI 展示的详情树一起截断。
-            control->directories.push_back({actual_target, metadata.permissions, detail});
+            control->directories.push_back({source, actual_target, metadata.permissions, detail});
         }
 
         if (root) {
@@ -770,6 +836,14 @@ public:
     void discover(const std::shared_ptr<Control>& control) {
         validate_transfer_paths(control->job.spec);
         auto source_endpoint = resolve_endpoint(control, control->job.spec.source);
+        if (source_endpoint->accepts(control->job.spec.target)) {
+            auto canonical_spec = control->job.spec;
+            canonical_spec.source = source_endpoint->canonical(canonical_spec.source);
+            canonical_spec.target = source_endpoint->canonical(canonical_spec.target);
+            validate_transfer_paths(canonical_spec);
+            if (source_endpoint->equivalent(control->job.spec.source, control->job.spec.target))
+                throw std::runtime_error("Source and target refer to the same filesystem object");
+        }
         const FileStat root = source_endpoint->stat(control->job.spec.source);
         source_endpoint.reset();
         if (root.kind == FileKind::Regular) {
@@ -801,6 +875,13 @@ public:
                    IFileEndpoint& target_endpoint,
                    const FileWork& work) {
         FileUri target = work.target;
+        if (!work.root) {
+            const auto boundary = target_endpoint.canonical(control->job.effective_target);
+            if (!target_is_descendant(boundary, target_endpoint.canonical(target)))
+                throw std::runtime_error("Target file escaped its transfer root");
+        }
+        if (source_endpoint.accepts(target) && source_endpoint.equivalent(work.source, target))
+            throw std::runtime_error("Source and target refer to the same file");
         std::uint64_t offset = 0;
         if (control->job.spec.conflict != ConflictPolicy::Overwrite &&
             target_endpoint.exists(target)) {
@@ -813,8 +894,7 @@ public:
                     detail.skipped = true;
                     mark_detail_changed_locked(control, work.detail);
                 }
-                if (work.root)
-                    control->job.skipped = true;
+                control->job.skipped = true;
                 return;
             }
             case ConflictPolicy::AutoRename:
@@ -831,6 +911,24 @@ public:
                     throw std::runtime_error("Resume target is not a compatible file");
                 }
                 offset = current.size;
+                if (offset != 0) {
+                    const auto check = [this, &control, detail = work.detail] {
+                        checkpoint(control, detail);
+                    };
+                    const auto source_prefix =
+                        prefix_digest(source_endpoint, work.source, offset, check);
+                    const auto target_prefix =
+                        prefix_digest(target_endpoint, target, offset, check);
+                    const auto source_now = source_endpoint.stat(work.source);
+                    const auto target_now = target_endpoint.stat(target);
+                    if (source_now.kind != FileKind::Regular ||
+                        source_now.size != work.metadata.size ||
+                        source_now.modified != work.metadata.modified ||
+                        target_now.kind != FileKind::Regular || target_now.size != offset ||
+                        target_now.modified != current.modified || source_prefix != target_prefix)
+                        throw std::runtime_error(
+                            "Resume prefix mismatch or file changed; choose overwrite to restart");
+                }
                 add_progress(control, offset, work.aggregate_detail);
                 break;
             }
@@ -839,6 +937,20 @@ public:
             }
         }
 
+        const bool staged = control->job.spec.conflict == ConflictPolicy::AutoRename;
+        const FileUri write_target = staged ? temporary_transfer_file(target) : target;
+        struct TemporaryGuard {
+            IFileEndpoint& endpoint;
+            FileUri uri;
+            bool active;
+            ~TemporaryGuard() {
+                if (active) {
+                    try {
+                        endpoint.remove(uri, false);
+                    } catch (...) {}
+                }
+            }
+        } temporary{target_endpoint, write_target, staged};
         checkpoint(control, work.detail);
         const auto task_buffer_size =
             configured_buffer_size == kAdaptiveBufferBytes
@@ -846,7 +958,7 @@ public:
                 : configured_buffer_size;
         {
             auto input = source_endpoint.open_read(work.source, offset);
-            auto output = target_endpoint.open_write(target, offset, offset == 0);
+            auto output = target_endpoint.open_write(write_target, offset, offset == 0);
             output->set_cancellation_flag(control->cancellation_flag);
             std::vector<std::byte> buffer(task_buffer_size);
             for (;;) {
@@ -864,18 +976,19 @@ public:
         }
 
         checkpoint(control, work.detail);
-        const auto target_stat = target_endpoint.stat(target);
+        const auto target_stat = target_endpoint.stat(write_target);
         if (target_stat.kind != FileKind::Regular || target_stat.size != work.metadata.size) {
             throw std::runtime_error("Target size verification failed");
         }
-        if (control->job.spec.verify_sha256 &&
+        // 已有前缀可能在预检后被外部改写；续传必须做完整校验，不能以大小相同报成功。
+        if ((control->job.spec.verify_sha256 || offset != 0) &&
             digest(source_endpoint,
                    work.source,
                    task_buffer_size,
                    [this, &control, detail = work.detail] {
                        checkpoint(control, detail);
                    }) != digest(target_endpoint,
-                                target,
+                                write_target,
                                 task_buffer_size,
                                 [this, &control, detail = work.detail] {
                                     checkpoint(control, detail);
@@ -883,7 +996,30 @@ public:
             throw std::runtime_error("SHA-256 verification failed");
         }
         checkpoint(control, work.detail);
-        restore_permissions_best_effort(target_endpoint, target, work.metadata.permissions);
+        restore_permissions_best_effort(target_endpoint, write_target, work.metadata.permissions);
+        if (staged) {
+            for (;;) {
+                checkpoint(control, work.detail);
+                try {
+                    target_endpoint.rename(write_target, target, false);
+                    temporary.active = false;
+                    break;
+                } catch (...) {
+                    if (!target_endpoint.exists(target))
+                        throw;
+                    target = auto_rename(target_endpoint, work.target);
+                }
+            }
+            set_detail_target(control, work.detail, target);
+            if (work.root) {
+                std::scoped_lock lock(mutex);
+                control->job.effective_target = target;
+            }
+        }
+        if (control->job.spec.move) {
+            std::scoped_lock lock(mutex);
+            control->copied_files.push_back({work, target});
+        }
     }
 
     void finalize(const std::shared_ptr<Control>& control) {
@@ -899,9 +1035,52 @@ public:
             }
         }
         if (control->job.spec.move && !control->job.skipped) {
-            checkpoint(control);
-            auto source_endpoint = resolve_endpoint(control, control->job.spec.source);
-            source_endpoint->remove(control->job.spec.source, true);
+            // 先验证全部源文件仍是复制时的版本，再逐文件删除。绝不能递归删除
+            // 整棵源树：扫描后新增的文件不在任务清单中，必须原样保留。
+            for (const auto& copied : control->copied_files) {
+                checkpoint(control);
+                std::array<std::uint8_t, 32> target_hash;
+                {
+                    auto endpoint = resolve_endpoint(control, copied.target);
+                    target_hash =
+                        digest(*endpoint, copied.target, kMinBufferBytes, [this, &control] {
+                            checkpoint(control);
+                        });
+                }
+                auto endpoint = resolve_endpoint(control, copied.work.source);
+                const auto before = endpoint->stat(copied.work.source);
+                const auto source_hash =
+                    digest(*endpoint, copied.work.source, kMinBufferBytes, [this, &control] {
+                        checkpoint(control);
+                    });
+                const auto after = endpoint->stat(copied.work.source);
+                if (before.kind != FileKind::Regular || before.size != copied.work.metadata.size ||
+                    before.modified != copied.work.metadata.modified || before.size != after.size ||
+                    before.modified != after.modified || source_hash != target_hash)
+                    throw std::runtime_error(
+                        "Source changed during move; source files were preserved");
+            }
+            for (const auto& copied : control->copied_files) {
+                checkpoint(control);
+                auto endpoint = resolve_endpoint(control, copied.work.source);
+                const auto current = endpoint->stat(copied.work.source);
+                if (current.kind != FileKind::Regular ||
+                    current.size != copied.work.metadata.size ||
+                    current.modified != copied.work.metadata.modified)
+                    throw std::runtime_error(
+                        "Source changed before removal; remaining source files were preserved");
+                endpoint->remove(copied.work.source, false);
+            }
+            for (auto iterator = control->directories.rbegin();
+                 iterator != control->directories.rend();
+                 ++iterator) {
+                checkpoint(control);
+                auto endpoint = resolve_endpoint(control, iterator->source);
+                if (!endpoint->list(iterator->source).empty())
+                    throw std::runtime_error(
+                        "Source directory gained new entries; remaining content was preserved");
+                endpoint->remove(iterator->source, false);
+            }
         }
     }
 
@@ -1523,49 +1702,101 @@ std::optional<TransferJob> TransferManager::get(const TransferId id) const {
 }
 
 std::vector<TransferJob> TransferManager::jobs() const {
-    std::scoped_lock lock(impl_->mutex);
     std::vector<TransferJob> result;
-    result.reserve(impl_->controls.size());
-    for (const auto& [id, control] : impl_->controls) {
-        (void)id;
-        result.push_back(control->job);
+    {
+        std::scoped_lock lock(impl_->mutex);
+        result.reserve(impl_->controls.size());
+        for (const auto& [id, control] : impl_->controls) {
+            (void)id;
+            result.push_back(control->job);
+        }
     }
     std::ranges::sort(result, {}, &TransferJob::id);
     return result;
 }
 
 TransferJobSnapshot TransferManager::job_snapshot(const std::uint64_t after_revision) const {
-    std::scoped_lock lock(impl_->mutex);
     TransferJobSnapshot result;
-    result.revision = impl_->job_revision;
-    if (after_revision == result.revision)
-        return result;
-    result.reset =
-        after_revision == 0 || after_revision > result.revision ||
-        after_revision < impl_->job_structure_revision ||
-        (!impl_->job_changes.empty() && after_revision < impl_->job_changes.front().first - 1);
-    if (result.reset) {
-        result.items.reserve(impl_->controls.size());
-        for (const auto& [id, control] : impl_->controls)
-            result.items.push_back(control->job);
-    } else {
-        std::unordered_set<TransferId> ids;
-        for (auto it = impl_->job_changes.rbegin();
-             it != impl_->job_changes.rend() && it->first > after_revision;
-             ++it)
-            ids.insert(it->second);
-        result.items.reserve(ids.size());
-        for (const auto id : ids) {
-            if (const auto found = impl_->controls.find(id); found != impl_->controls.end())
-                result.items.push_back(found->second->job);
+    {
+        std::scoped_lock lock(impl_->mutex);
+        result.revision = impl_->job_revision;
+        if (after_revision == result.revision)
+            return result;
+        result.reset =
+            after_revision == 0 || after_revision > result.revision ||
+            after_revision < impl_->job_structure_revision ||
+            (!impl_->job_changes.empty() && after_revision < impl_->job_changes.front().first - 1);
+        if (result.reset) {
+            result.items.reserve(impl_->controls.size());
+            for (const auto& [id, control] : impl_->controls)
+                result.items.push_back(control->job);
+        } else {
+            std::unordered_set<TransferId> ids;
+            for (auto it = impl_->job_changes.rbegin();
+                 it != impl_->job_changes.rend() && it->first > after_revision;
+                 ++it)
+                ids.insert(it->second);
+            result.items.reserve(ids.size());
+            for (const auto id : ids) {
+                if (const auto found = impl_->controls.find(id); found != impl_->controls.end())
+                    result.items.push_back(found->second->job);
+            }
         }
     }
+    // 排序只依赖快照，不让全部传输工作线程为 UI 排序等待全局锁。
     std::ranges::sort(result.items, {}, &TransferJob::id);
     return result;
 }
 
 TransferDetailSnapshot TransferManager::details(const TransferId id,
                                                 const std::uint64_t after_revision) const {
+    // 大目录分块复制详情，在块之间放开全局锁，让暂停/取消及其他文件的进度更新通过。
+    // revision 固定为读取开始时的水位；块内若看到更新值，下次增量仍会再次覆盖它，
+    // 因而不会把尚未读取的变化错误地标记成已消费。重试导致拓扑重置时重新取快照。
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        std::shared_ptr<Impl::Control> control;
+        TransferDetailSnapshot result;
+        std::vector<std::size_t> indices;
+        indices.reserve(Impl::kMaximumDetailChanges);
+        std::uint64_t reset_revision{};
+        std::size_t count{};
+        {
+            std::scoped_lock lock(impl_->mutex);
+            control = impl_->find_locked(id);
+            result.revision = control->detail_revision;
+            if (after_revision == result.revision)
+                return result;
+            reset_revision = control->detail_reset_revision;
+            result.reset = after_revision == 0 || after_revision > result.revision ||
+                           after_revision < reset_revision ||
+                           after_revision < control->oldest_incremental_revision;
+            count = control->details.size();
+            if (!result.reset)
+                for (const auto& change : control->detail_changes)
+                    if (change.revision > after_revision && change.index < count)
+                        indices.push_back(change.index);
+        }
+        if (!result.reset) {
+            std::ranges::sort(indices);
+            indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+            count = indices.size();
+        }
+        result.items.reserve(count);
+        bool restarted{};
+        constexpr std::size_t kCopyChunkItems = 64;
+        for (std::size_t offset = 0; offset < count; offset += kCopyChunkItems) {
+            std::scoped_lock lock(impl_->mutex);
+            if (control->detail_reset_revision != reset_revision) {
+                restarted = true;
+                break;
+            }
+            for (auto item = offset; item < (std::min)(count, offset + kCopyChunkItems); ++item)
+                result.items.push_back(control->details[result.reset ? item : indices[item]]);
+        }
+        if (!restarted)
+            return result;
+    }
+    // 极端快速连续重试时退回一次原子复制，避免 UI 调用无限重试。
     std::scoped_lock lock(impl_->mutex);
     const auto found = impl_->controls.find(id);
     if (found == impl_->controls.end()) {
@@ -1600,8 +1831,10 @@ bool TransferManager::wait(const TransferId id, const std::chrono::milliseconds 
     const auto found = impl_->controls.find(id);
     if (found == impl_->controls.end())
         return false;
+    // 等待期间容器可能清空/重排，必须持有任务本身，不能捕获迭代器。
+    const auto control = found->second;
     return impl_->changed.wait_for(lock, timeout, [&] {
-        return terminal_state(found->second->job.state);
+        return terminal_state(control->job.state);
     });
 }
 

@@ -194,7 +194,8 @@ struct EditorController::Impl {
         std::shared_ptr<transfer::IFileEndpoint> endpoint;
         std::unique_ptr<editor::RemoteDocument> document;
         std::optional<editor::ConflictSnapshot> conflict;
-        std::optional<transfer::FileUri> save_as_conflict_target;
+        // 仅 UI 线程访问，覆盖操作入队前可检查另存为目标是否已被打开。
+        std::optional<transfer::FileUri> ui_save_as_target;
         std::mutex mutex;
         std::atomic<std::uint64_t> edit_generation{};
         std::atomic<bool> ui_dirty{};
@@ -205,6 +206,12 @@ struct EditorController::Impl {
         std::shared_ptr<DocumentState> state;
         ui::EditorDocumentDescriptor descriptor;
         std::vector<std::byte> binary_probe;
+    };
+
+    struct PendingClose {
+        std::shared_ptr<DocumentState> state;
+        std::optional<ui::EditorSaveRequest> snapshot;
+        bool completed{}; // 由 state->mutex 保护，任务取消后仍由退出协调器接管。
     };
 
     ui::EditorPage& page;
@@ -230,6 +237,9 @@ struct EditorController::Impl {
     std::unordered_map<ui::EditorDocumentId, std::shared_ptr<DocumentState>> documents;
     std::unordered_map<std::string, ui::EditorDocumentId> uri_index;
     std::unordered_set<std::string> reopening_uris;
+    std::unordered_map<std::string, ui::EditorDocumentId> reserved_save_targets;
+    std::vector<std::shared_ptr<PendingClose>> pending_closes;
+    bool preparing_shutdown{}; // UI 线程退出屏障，不能与普通编辑并行提交。
 
     Impl(ui::EditorPage& editor_page, const storage::AppPaths& paths, EndpointResolver resolver)
         : page(editor_page), service(paths), endpoint_resolver(std::move(resolver)) {
@@ -264,8 +274,8 @@ struct EditorController::Impl {
         }
 
         try {
-            scheduler = std::make_unique<EditorWorkScheduler>(
-                4, [this](std::exception_ptr failure) {
+            scheduler =
+                std::make_unique<EditorWorkScheduler>(4, [this](std::exception_ptr failure) {
                     try {
                         std::rethrow_exception(failure);
                     } catch (const std::exception& error) {
@@ -287,31 +297,22 @@ struct EditorController::Impl {
         stopping.store(true, std::memory_order_release);
         UnbindPageCallbacks();
 
-        struct PendingClose {
-            std::shared_ptr<DocumentState> state;
-            std::optional<std::string> text;
-        };
-        std::vector<PendingClose> pending;
-        pending.reserve(documents.size());
+        auto pending = pending_closes;
+        pending.reserve(pending.size() + documents.size());
         for (const auto& [id, state] : documents) {
-            std::optional<std::string> text;
-            if (state->ui_dirty.load(std::memory_order_acquire)) {
-                text = page.DocumentText(id);
-            }
-            pending.push_back({state, std::move(text)});
+            if (state->closing.load(std::memory_order_acquire))
+                continue; // pending_closes 已持有这份快照，不能在关闭后重复 UpdateText。
+            auto item = std::make_shared<PendingClose>();
+            item->state = state;
+            if (state->ui_dirty.load(std::memory_order_acquire))
+                item->snapshot = page.DocumentSnapshot(id);
+            pending.push_back(std::move(item));
         }
 
         scheduler->Stop();
-        for (auto& item : pending) {
-            std::scoped_lock lock(item.state->mutex);
-            if (!item.state->document) {
-                continue;
-            }
-            if (item.text) {
-                item.state->document->UpdateText(std::move(*item.text));
-            }
-            item.state->document->Close();
-        }
+        for (const auto& item : pending)
+            (void)CompleteClose(*item);
+        pending_closes.clear();
         documents.clear();
         uri_index.clear();
 
@@ -405,9 +406,8 @@ struct EditorController::Impl {
         return uri.is_sftp() ? "sftp:" + uri.authority() : "local";
     }
 
-    void Enqueue(std::string lane,
-                 std::function<void()> action,
-                 std::chrono::milliseconds delay = {}) {
+    void
+    Enqueue(std::string lane, std::function<void()> action, std::chrono::milliseconds delay = {}) {
         if (stopping.load(std::memory_order_acquire)) {
             return;
         }
@@ -498,6 +498,8 @@ struct EditorController::Impl {
             });
             return;
         }
+        if (preparing_shutdown)
+            return;
         const auto key = uri.to_string();
         if (reopening_uris.contains(key)) {
             return;
@@ -509,7 +511,8 @@ struct EditorController::Impl {
                 return;
             }
             const auto state = documents.find(id);
-            if (state == documents.end()) {
+            if (state == documents.end() ||
+                state->second->closing.load(std::memory_order_acquire)) {
                 return;
             }
             if (page.DocumentSaving(id)) {
@@ -556,6 +559,11 @@ struct EditorController::Impl {
             return;
         }
 
+        if (reserved_save_targets.contains(key)) {
+            ReportError(L"打开文件", L"此文件正在被另存为，请等待保存结束后再打开。");
+            return;
+        }
+
         auto state = std::make_shared<DocumentState>();
         state->id = next_document_id++;
         state->uri = std::move(uri);
@@ -577,7 +585,9 @@ struct EditorController::Impl {
                     std::scoped_lock lock(state->mutex);
                     state->endpoint = std::move(endpoint);
                     state->document = std::move(opened).value();
-                    payload->descriptor = Describe(*state, *state->document);
+                    state->ui_dirty.store(state->document->dirty(), std::memory_order_release);
+                    payload->descriptor =
+                        Describe(*state, *state->document, state->document->dirty());
                     if (state->document->mode() == editor::DocumentMode::ReadOnlyBinary) {
                         payload->binary_probe = ReadBinaryProbe(*state->endpoint, state->uri);
                     }
@@ -735,8 +745,9 @@ struct EditorController::Impl {
         auto state = found->second;
         state->ui_dirty.store(true, std::memory_order_release);
         const auto generation = state->edit_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
-        Enqueue(
+        scheduler->EnqueueLatest(
             state->lane,
+            "checkpoint:" + std::to_string(id),
             [this, state, id, generation] {
                 if (state->closing.load(std::memory_order_acquire) ||
                     state->edit_generation.load(std::memory_order_acquire) != generation) {
@@ -751,27 +762,72 @@ struct EditorController::Impl {
                     if (!text) {
                         return;
                     }
-                    Enqueue(state->lane,
-                            [this, state, generation, text = std::move(*text)]() mutable {
-                        if (state->closing.load(std::memory_order_acquire) ||
-                            state->edit_generation.load(std::memory_order_acquire) != generation) {
-                            return;
-                        }
-                        editor::EditorStatus status;
-                        {
-                            std::scoped_lock lock(state->mutex);
-                            if (!state->document) {
+                    scheduler->EnqueueLatest(
+                        state->lane,
+                        "checkpoint:" + std::to_string(id),
+                        [this, state, generation, text = std::move(*text)]() mutable {
+                            if (state->closing.load(std::memory_order_acquire) ||
+                                state->edit_generation.load(std::memory_order_acquire) !=
+                                    generation) {
                                 return;
                             }
-                            status = state->document->UpdateText(std::move(text));
-                        }
-                        if (!status) {
-                            ReportErrorAsync(L"保存编辑器恢复缓存", status.message);
-                        }
-                            });
+                            editor::EditorStatus status;
+                            {
+                                std::scoped_lock lock(state->mutex);
+                                if (!state->document) {
+                                    return;
+                                }
+                                status = state->document->UpdateText(std::move(text));
+                            }
+                            if (!status) {
+                                ReportErrorAsync(L"保存编辑器恢复缓存", status.message);
+                            }
+                        });
                 });
             },
             kCheckpointDelay);
+    }
+
+    bool ReserveSaveTarget(const std::shared_ptr<DocumentState>& state,
+                           const transfer::FileUri& target) {
+        const auto key = target.to_string();
+        const auto opened = uri_index.find(key);
+        const auto reserved = reserved_save_targets.find(key);
+        if ((opened != uri_index.end() && opened->second != state->id) ||
+            (reserved != reserved_save_targets.end() && reserved->second != state->id) ||
+            reopening_uris.contains(key)) {
+            ReportError(L"另存为",
+                        L"目标文件已在其他标签打开或正在处理，请先关闭该文件或选择其他名称。");
+            return false;
+        }
+        reserved_save_targets[key] = state->id;
+        return true;
+    }
+
+    void ReleaseSaveTarget(const std::shared_ptr<DocumentState>& state) {
+        std::erase_if(reserved_save_targets, [&](const auto& item) {
+            return item.second == state->id;
+        });
+    }
+
+    void FinishSave(const std::shared_ptr<DocumentState>& state,
+                    std::uint64_t generation,
+                    const std::optional<ui::EditorDocumentDescriptor>& location = std::nullopt) {
+        if (location) {
+            page.SetDocumentLocation(
+                state->id, location->title, location->server_id, location->remote_path);
+        }
+        state->ui_save_as_target.reset();
+        page.ClearDocumentConflict(state->id);
+        // 网络往返期间可以继续输入。旧保存结果只能确认旧版本，绝不能覆盖
+        // 当前正文、设置新保存点，或清掉新编辑的 dirty/恢复缓存。
+        if (state->edit_generation.load(std::memory_order_acquire) == generation) {
+            state->ui_dirty.store(false, std::memory_order_release);
+            page.MarkDocumentSaved(state->id);
+        } else {
+            page.SetDocumentSaving(state->id, false);
+            OnDocumentChanged(state->id);
+        }
     }
 
     void OnSave(ui::EditorSaveRequest request) {
@@ -783,11 +839,11 @@ struct EditorController::Impl {
         if (state->closing.load(std::memory_order_acquire)) {
             return;
         }
-        state->edit_generation.fetch_add(1, std::memory_order_acq_rel);
+        const auto generation = state->edit_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
         state->ui_dirty.store(true, std::memory_order_release);
         page.SetDocumentSaving(request.id, true);
 
-        Enqueue(state->lane, [this, state, request = std::move(request)]() mutable {
+        Enqueue(state->lane, [this, state, generation, request = std::move(request)]() mutable {
             editor::EditorStatus update;
             std::optional<editor::SaveResult> saved;
             editor::EditorStatus failure;
@@ -802,7 +858,6 @@ struct EditorController::Impl {
                     if (result) {
                         saved = std::move(result).value();
                         state->conflict = saved->conflict;
-                        state->save_as_conflict_target.reset();
                     } else {
                         failure = result.status();
                     }
@@ -811,6 +866,7 @@ struct EditorController::Impl {
 
             PostToUi([this,
                       state,
+                      generation,
                       update = std::move(update),
                       saved = std::move(saved),
                       failure = std::move(failure)] {
@@ -828,13 +884,13 @@ struct EditorController::Impl {
                     return;
                 }
                 if (saved->outcome == editor::SaveOutcome::Conflict) {
+                    state->ui_save_as_target.reset();
                     page.SetDocumentSaving(state->id, false);
                     page.SetDocumentConflict(state->id,
                                              L"远端文件已变化；请选择查看差异、覆盖或另存为。");
                     return;
                 }
-                state->ui_dirty.store(false, std::memory_order_release);
-                page.MarkDocumentSaved(state->id);
+                FinishSave(state, generation);
             });
         });
     }
@@ -867,71 +923,73 @@ struct EditorController::Impl {
             return;
         }
         auto state = found->second;
-        if (state->closing.load(std::memory_order_acquire)) {
+        if (state->closing.load(std::memory_order_acquire) || page.DocumentSaving(state->id)) {
             return;
         }
-        state->edit_generation.fetch_add(1, std::memory_order_acq_rel);
+        const auto target = state->ui_save_as_target;
+        if (target && !ReserveSaveTarget(state, *target))
+            return;
+        const auto generation = state->edit_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
         state->ui_dirty.store(true, std::memory_order_release);
         page.SetDocumentSaving(request.id, true);
         const auto old_uri = state->uri;
-        Enqueue(state->lane, [this, state, old_uri, request = std::move(request)]() mutable {
-            editor::EditorStatus update;
-            std::optional<editor::SaveResult> saved;
-            editor::EditorStatus failure;
-            std::optional<ui::EditorDocumentDescriptor> descriptor;
-            transfer::FileUri new_uri;
-            {
-                std::scoped_lock lock(state->mutex);
-                if (!state->document || state->closing.load(std::memory_order_acquire)) {
-                    return;
-                }
-                update = CheckpointForSave(*state->document, request);
-                if (update) {
-                    editor::EditorResult<editor::SaveResult> result =
-                        state->save_as_conflict_target
-                            ? state->document->SaveAs(*state->save_as_conflict_target, true)
-                            : state->document->Save(editor::SaveMode::OverwriteRemote);
-                    if (result) {
-                        saved = std::move(result).value();
-                        state->conflict.reset();
-                        state->save_as_conflict_target.reset();
-                        new_uri = state->document->uri();
-                        descriptor = Describe(*state, *state->document, false);
-                    } else {
-                        failure = result.status();
+        Enqueue(state->lane,
+                [this, state, old_uri, target, generation, request = std::move(request)]() mutable {
+                    editor::EditorStatus update;
+                    std::optional<editor::SaveResult> saved;
+                    editor::EditorStatus failure;
+                    std::optional<ui::EditorDocumentDescriptor> descriptor;
+                    transfer::FileUri new_uri;
+                    {
+                        std::scoped_lock lock(state->mutex);
+                        if (!state->document || state->closing.load(std::memory_order_acquire)) {
+                            PostToUi([this, state] {
+                                ReleaseSaveTarget(state);
+                            });
+                            return;
+                        }
+                        update = CheckpointForSave(*state->document, request);
+                        if (update) {
+                            editor::EditorResult<editor::SaveResult> result =
+                                target ? state->document->SaveAs(*target, true)
+                                       : state->document->Save(editor::SaveMode::OverwriteRemote);
+                            if (result) {
+                                saved = std::move(result).value();
+                                state->conflict.reset();
+                                new_uri = state->document->uri();
+                                descriptor = Describe(*state, *state->document, false);
+                            } else {
+                                failure = result.status();
+                            }
+                        }
                     }
-                }
-            }
-            PostToUi([this,
-                      state,
-                      old_uri,
-                      new_uri = std::move(new_uri),
-                      descriptor = std::move(descriptor),
-                      update = std::move(update),
-                      saved = std::move(saved),
-                      failure = std::move(failure)]() mutable {
-                if (!IsCurrent(state)) {
-                    return;
-                }
-                if (!update || !saved) {
-                    page.SetDocumentSaving(state->id, false);
-                    ReportError(L"覆盖远端文件",
-                                Utf8ToWide(!update ? update.message : failure.message));
-                    return;
-                }
-                if (new_uri != old_uri) {
-                    uri_index.erase(old_uri.to_string());
-                    uri_index[new_uri.to_string()] = state->id;
-                    state->uri = new_uri;
-                }
-                state->ui_dirty.store(false, std::memory_order_release);
-                page.ClearDocumentConflict(state->id);
-                if (descriptor) {
-                    page.OpenDocument(std::move(*descriptor));
-                }
-                page.MarkDocumentSaved(state->id);
-            });
-        });
+                    PostToUi([this,
+                              state,
+                              old_uri,
+                              generation,
+                              new_uri = std::move(new_uri),
+                              descriptor = std::move(descriptor),
+                              update = std::move(update),
+                              saved = std::move(saved),
+                              failure = std::move(failure)]() mutable {
+                        ReleaseSaveTarget(state);
+                        if (!IsCurrent(state)) {
+                            return;
+                        }
+                        if (!update || !saved) {
+                            page.SetDocumentSaving(state->id, false);
+                            ReportError(L"覆盖远端文件",
+                                        Utf8ToWide(!update ? update.message : failure.message));
+                            return;
+                        }
+                        if (new_uri != old_uri) {
+                            uri_index.erase(old_uri.to_string());
+                            uri_index[new_uri.to_string()] = state->id;
+                            state->uri = new_uri;
+                        }
+                        FinishSave(state, generation, descriptor);
+                    });
+                });
     }
 
     void OnSaveAs(ui::EditorSaveRequest request) {
@@ -943,22 +1001,26 @@ struct EditorController::Impl {
             ReportError(L"远程另存为", L"尚未配置远程目标路径选择器，本次未写入远端。");
             return;
         }
-        auto target = save_as_target_resolver(found->second->uri);
+        auto state = found->second;
+        if (state->closing.load(std::memory_order_acquire) || page.DocumentSaving(state->id))
+            return;
+        auto target = save_as_target_resolver(state->uri);
         if (!target) {
             return;
         }
-        auto state = found->second;
-        if (state->closing.load(std::memory_order_acquire)) {
+        if (!IsCurrent(state) || state->closing.load(std::memory_order_acquire) ||
+            page.DocumentSaving(state->id) || !ReserveSaveTarget(state, *target)) {
             return;
         }
         const auto old_uri = state->uri;
-        state->edit_generation.fetch_add(1, std::memory_order_acq_rel);
+        const auto generation = state->edit_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
         state->ui_dirty.store(true, std::memory_order_release);
         page.SetDocumentSaving(request.id, true);
         Enqueue(state->lane,
                 [this,
                  state,
                  old_uri,
+                 generation,
                  target = std::move(*target),
                  request = std::move(request)]() mutable {
                     editor::EditorStatus update;
@@ -969,21 +1031,20 @@ struct EditorController::Impl {
                     {
                         std::scoped_lock lock(state->mutex);
                         if (!state->document || state->closing.load(std::memory_order_acquire)) {
+                            PostToUi([this, state] {
+                                ReleaseSaveTarget(state);
+                            });
                             return;
                         }
                         update = CheckpointForSave(*state->document, request);
                         if (update) {
-                            const auto selected_target = target;
-                            auto result = state->document->SaveAs(std::move(target), false);
+                            auto result = state->document->SaveAs(target, false);
                             if (result) {
                                 saved = std::move(result).value();
                                 state->conflict = saved->conflict;
                                 if (saved->outcome == editor::SaveOutcome::Saved) {
-                                    state->save_as_conflict_target.reset();
                                     new_uri = state->document->uri();
                                     descriptor = Describe(*state, *state->document, false);
-                                } else {
-                                    state->save_as_conflict_target = selected_target;
                                 }
                             } else {
                                 failure = result.status();
@@ -993,11 +1054,14 @@ struct EditorController::Impl {
                     PostToUi([this,
                               state,
                               old_uri,
+                              generation,
+                              selected_target = target,
                               new_uri = std::move(new_uri),
                               update = std::move(update),
                               saved = std::move(saved),
                               failure = std::move(failure),
                               descriptor = std::move(descriptor)]() mutable {
+                        ReleaseSaveTarget(state);
                         if (!IsCurrent(state)) {
                             return;
                         }
@@ -1008,6 +1072,7 @@ struct EditorController::Impl {
                             return;
                         }
                         if (saved->outcome == editor::SaveOutcome::Conflict) {
+                            state->ui_save_as_target = selected_target;
                             page.SetDocumentSaving(state->id, false);
                             page.SetDocumentConflict(
                                 state->id, L"另存为目标已存在；请选择其他名称，或确认覆盖后重试。");
@@ -1016,12 +1081,7 @@ struct EditorController::Impl {
                         uri_index.erase(old_uri.to_string());
                         uri_index[new_uri.to_string()] = state->id;
                         state->uri = new_uri;
-                        state->ui_dirty.store(false, std::memory_order_release);
-                        page.ClearDocumentConflict(state->id);
-                        if (descriptor) {
-                            page.OpenDocument(std::move(*descriptor));
-                        }
-                        page.MarkDocumentSaved(state->id);
+                        FinishSave(state, generation, descriptor);
                     });
                 });
     }
@@ -1060,6 +1120,32 @@ struct EditorController::Impl {
         MessageBoxW(page.hwnd(), message.c_str(), L"远端差异", MB_OK | MB_ICONINFORMATION);
     }
 
+    static editor::EditorStatus CompleteClose(PendingClose& pending, bool close = true) try {
+        std::scoped_lock lock(pending.state->mutex);
+        if (pending.completed || !pending.state->document)
+            return editor::EditorStatus::Ok();
+        auto& document = *pending.state->document;
+        if (pending.snapshot) {
+            auto status = document.UpdateText(pending.snapshot->content,
+                                              ToDocumentEncoding(pending.snapshot->encoding));
+            // GB2312 无法表达新字符不应妨碍保留 Unicode 恢复副本。
+            if (!status && status.code == editor::EditorErrc::Unsupported)
+                status = document.UpdateText(pending.snapshot->content);
+            if (!status)
+                return status;
+        }
+        if (!close)
+            return editor::EditorStatus::Ok();
+        auto status = document.Close();
+        pending.completed = status.ok();
+        return status;
+    } catch (const std::exception& error) {
+        return editor::EditorStatus::Error(editor::EditorErrc::IoError, error.what());
+    } catch (...) {
+        return editor::EditorStatus::Error(editor::EditorErrc::IoError,
+                                           "Cannot preserve editor snapshot");
+    }
+
     void OnClose(ui::EditorDocumentId id, bool dirty) {
         const auto found = documents.find(id);
         if (found == documents.end()) {
@@ -1067,6 +1153,8 @@ struct EditorController::Impl {
             return;
         }
         auto state = found->second;
+        if (state->closing.load(std::memory_order_acquire) || preparing_shutdown)
+            return;
         if (dirty) {
             bool allow = false;
             if (close_confirmation) {
@@ -1083,34 +1171,101 @@ struct EditorController::Impl {
             }
         }
 
-        auto text = dirty ? page.DocumentText(id) : std::optional<std::string>{};
+        auto pending = std::make_shared<PendingClose>();
+        pending->state = state;
+        if (dirty)
+            pending->snapshot = page.DocumentSnapshot(id);
+        if (dirty && !pending->snapshot) {
+            ReportError(L"保留未保存内容", L"无法读取正文快照，标签已保留。");
+            return;
+        }
+        pending_closes.push_back(pending);
         state->closing.store(true, std::memory_order_release);
         state->edit_generation.fetch_add(1, std::memory_order_acq_rel);
-        uri_index.erase(state->uri.to_string());
-        documents.erase(found);
-        page.CloseDocument(id);
+        scheduler->CancelLatest("checkpoint:" + std::to_string(id));
+        // 不先撤掉唯一的可见正文。临时只读保证提交快照与最终移除的是同一版本。
+        page.SetDocumentClosing(id, true);
 
-        Enqueue(state->lane, [this, state, text = std::move(text)]() mutable {
-            editor::EditorStatus update;
-            editor::EditorStatus closed;
-            {
-                std::scoped_lock lock(state->mutex);
-                if (!state->document) {
+        Enqueue(state->lane, [this, pending] {
+            const auto status = CompleteClose(*pending);
+            PostToUi([this, pending, status] {
+                std::erase(pending_closes, pending);
+                const auto& state = pending->state;
+                if (status) {
+                    uri_index.erase(state->uri.to_string());
+                    documents.erase(state->id);
+                    page.CloseDocument(state->id);
+                } else {
+                    state->closing.store(false, std::memory_order_release);
+                    page.SetDocumentClosing(state->id, false);
+                    ReportError(L"保留未保存内容", Utf8ToWide(status.message));
+                }
+            });
+        });
+    }
+
+    void PrepareForShutdown(std::function<void(bool)> completed) {
+        if (preparing_shutdown) {
+            completed(false);
+            return;
+        }
+        preparing_shutdown = true;
+        std::vector<std::shared_ptr<PendingClose>> snapshots;
+        for (const auto& [id, state] : documents) {
+            if (state->closing.load(std::memory_order_acquire))
+                continue;
+            auto item = std::make_shared<PendingClose>();
+            item->state = state;
+            if (state->ui_dirty.load(std::memory_order_acquire)) {
+                item->snapshot = page.DocumentSnapshot(id);
+                if (!item->snapshot) {
+                    for (const auto& previous : snapshots)
+                        page.SetDocumentClosing(previous->state->id, false);
+                    preparing_shutdown = false;
+                    ReportError(L"退出已取消", L"无法读取正文快照，窗口已保留。");
+                    completed(false);
                     return;
                 }
-                if (text) {
-                    update = state->document->UpdateText(std::move(*text));
-                }
-                if (!text || update) {
-                    closed = state->document->Close();
-                }
+                state->edit_generation.fetch_add(1, std::memory_order_acq_rel);
             }
-            if (text && !update) {
-                ReportErrorAsync(L"保留未保存内容", update.message);
-            } else if (!closed) {
-                ReportErrorAsync(L"关闭远程文件", closed.message);
-            }
-        });
+            snapshots.push_back(std::move(item));
+            page.SetDocumentClosing(id, true);
+        }
+        // control 队列是排他屏障：等已在执行的保存/关闭结束，再写恢复缓存。
+        // 不调用 Close，失败时全部正文、端点和缓存租约仍可供用户继续编辑。
+        auto closing_snapshots = pending_closes;
+        Enqueue(
+            "control",
+            [this,
+             snapshots = std::move(snapshots),
+             closing_snapshots = std::move(closing_snapshots),
+             completed = std::move(completed)] {
+                auto status = editor::EditorStatus::Ok();
+                try {
+                    for (const auto& item : snapshots) {
+                        const auto current = CompleteClose(*item, false);
+                        if (!current && status)
+                            status = current;
+                    }
+                    // 单标签关闭失败的 UI 回调可能尚未消费，不能因此放行退出。
+                    // 该标签仍有 readonly UI 快照；其缓存失败由下面的检查直接报告。
+                    for (const auto& item : closing_snapshots) {
+                        const auto current = CompleteClose(*item, false);
+                        if (!current && status)
+                            status = current;
+                    }
+                } catch (const std::exception& error) {
+                    status = editor::EditorStatus::Error(editor::EditorErrc::IoError, error.what());
+                }
+                PostToUi([this, snapshots, completed, status] {
+                    preparing_shutdown = false;
+                    for (const auto& item : snapshots)
+                        page.SetDocumentClosing(item->state->id, false);
+                    if (!status)
+                        ReportError(L"退出已取消：无法保留未保存内容", Utf8ToWide(status.message));
+                    completed(status.ok());
+                });
+            });
     }
 };
 
@@ -1120,6 +1275,10 @@ EditorController::EditorController(ui::EditorPage& page,
     : impl_(std::make_unique<Impl>(page, paths, std::move(endpoint_resolver))) {}
 
 EditorController::~EditorController() = default;
+
+void EditorController::PrepareForShutdown(std::function<void(bool)> completed) {
+    impl_->PrepareForShutdown(std::move(completed));
+}
 
 void EditorController::Open(transfer::FileUri uri) {
     impl_->Open(std::move(uri));

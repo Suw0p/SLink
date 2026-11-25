@@ -15,6 +15,8 @@ public:
     [[nodiscard]] std::vector<DirectoryEntry> list(const FileUri& directory) override;
     [[nodiscard]] FileStat stat(const FileUri& uri) override;
     [[nodiscard]] bool exists(const FileUri& uri) override;
+    [[nodiscard]] bool equivalent(const FileUri& left, const FileUri& right) override;
+    [[nodiscard]] FileUri canonical(const FileUri& uri) override;
     [[nodiscard]] std::unique_ptr<IReadStream> open_read(const FileUri& uri,
                                                          std::uint64_t offset = 0) override;
     [[nodiscard]] std::unique_ptr<IWriteStream>

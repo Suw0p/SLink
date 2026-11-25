@@ -6,6 +6,9 @@
 
 namespace SLink::transfer {
 
+// 目录枚举中的名称必须是单个文件名，不能带路径或 Windows 设备/流语义。
+void ValidateFileName(std::string_view name, bool windows_target = false);
+
 // 跨本地文件系统和 SFTP 使用的规范资源标识。
 // local:///D:/path 的 authority 为空；sftp://<server-id>/path 的 authority 是稳定
 // 服务器配置 id，而不是可能变化的显示名称或主机地址。路径统一使用正斜杠序列化。

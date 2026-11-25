@@ -21,12 +21,58 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <system_error>
 #include <type_traits>
+#include <unordered_set>
 
 namespace SLink::editor {
+
+// 同一缓存目录中的文档身份只能由一个打开的文档持有，防止另存为或恢复
+// 创建第二个拥有者，导致某个标签关闭时删掉另一个标签的缓存。
+struct DocumentCacheRegistry {
+    std::mutex mutex;
+    std::unordered_set<std::string> owners;
+};
+
 namespace {
+
+std::shared_ptr<DocumentCacheRegistry> RegistryFor(const std::filesystem::path& directory) {
+    static std::mutex mutex;
+    static std::map<std::filesystem::path, std::weak_ptr<DocumentCacheRegistry>> registries;
+    std::scoped_lock lock(mutex);
+    auto& weak = registries[directory];
+    auto registry = weak.lock();
+    if (!registry) {
+        registry = std::make_shared<DocumentCacheRegistry>();
+        weak = registry;
+    }
+    return registry;
+}
+
+struct DocumentCacheLease {
+    std::shared_ptr<DocumentCacheRegistry> registry;
+    std::string key;
+
+    static std::unique_ptr<DocumentCacheLease>
+    Acquire(const std::shared_ptr<DocumentCacheRegistry>& registry, std::string key) {
+        auto lease = std::make_unique<DocumentCacheLease>();
+        std::scoped_lock lock(registry->mutex);
+        if (!registry->owners.insert(key).second)
+            return {};
+        lease->registry = registry;
+        lease->key = std::move(key);
+        return lease;
+    }
+    ~DocumentCacheLease() {
+        if (registry) {
+            std::scoped_lock lock(registry->mutex);
+            registry->owners.erase(key);
+        }
+    }
+};
 
 using transfer::FileKind;
 using transfer::FileStat;
@@ -332,6 +378,31 @@ EditorStatus RemoveCacheFile(const std::filesystem::path& path) {
     return error ? IoError("Cannot remove editor cache") : EditorStatus::Ok();
 }
 
+std::filesystem::path GenerationContentPath(const std::filesystem::path& metadata_path,
+                                            const ContentHash& hash) {
+    constexpr char hex[] = "0123456789abcdef";
+    std::string suffix;
+    suffix.reserve(hash.size() * 2);
+    for (const auto value : hash) {
+        const auto byte = std::to_integer<unsigned>(value);
+        suffix.push_back(hex[byte >> 4]);
+        suffix.push_back(hex[byte & 15]);
+    }
+    return metadata_path.parent_path() /
+           (metadata_path.stem().string() + "." + suffix + ".content");
+}
+
+std::filesystem::path CommittedContentPath(const std::filesystem::path& metadata_path,
+                                           const CacheMetadata& metadata) {
+    auto path = GenerationContentPath(metadata_path, metadata.content_sha256);
+    if (std::filesystem::exists(path))
+        return path;
+    // 已有的未保存缓存不能丢弃；原布局仍经过内容大小及 SHA-256 验证后读取。
+    auto original = metadata_path;
+    original.replace_extension(L".content");
+    return std::filesystem::exists(original) ? original : path;
+}
+
 EditorResult<std::vector<std::byte>>
 ReadEndpoint(IFileEndpoint& endpoint, const FileUri& uri, std::uint64_t maximum) {
     try {
@@ -486,6 +557,14 @@ TextInfo InspectText(std::span<const std::byte> bytes) {
 }
 
 EditorResult<std::vector<std::byte>> Materialize(const std::string& text, TextEncoding encoding) {
+    const auto too_large = [] {
+        return EditorResult<std::vector<std::byte>>::Failure(
+            EditorStatus::Error(EditorErrc::Unsupported, "Encoded file exceeds 20 MB"));
+    };
+    if (encoding != TextEncoding::Gb2312 &&
+        text.size() + (encoding == TextEncoding::Utf8Bom ? 3ULL : 0ULL) >
+            RemoteEditorService::kEditableSizeLimit)
+        return too_large();
     std::vector<std::byte> bytes;
     if (encoding == TextEncoding::Utf8Bom) {
         bytes.insert(bytes.end(), {std::byte{0xef}, std::byte{0xbb}, std::byte{0xbf}});
@@ -496,6 +575,8 @@ EditorResult<std::vector<std::byte>> Materialize(const std::string& text, TextEn
             return EditorResult<std::vector<std::byte>>::Failure(EditorStatus::Error(
                 EditorErrc::Unsupported, "Text contains characters not representable in GB2312"));
         }
+        if (encoded->size() > RemoteEditorService::kEditableSizeLimit)
+            return too_large();
         bytes.insert(bytes.end(),
                      reinterpret_cast<const std::byte*>(encoded->data()),
                      reinterpret_cast<const std::byte*>(encoded->data() + encoded->size()));
@@ -563,6 +644,7 @@ std::string TemporaryRemoteName(const FileUri& uri) {
 // 文档对象同时维护远端基准修订和本地恢复缓存身份。dirty=true 时每次 UpdateText 都先
 // 原子更新缓存，只有缓存成功才提交内存文本，确保异常退出后恢复内容不落后于 UI 状态。
 struct RemoteDocument::Impl {
+    std::unique_ptr<DocumentCacheLease> cache_lease;
     std::shared_ptr<IFileEndpoint> endpoint;
     FileUri uri;
     DocumentMode mode{DocumentMode::Editable};
@@ -572,6 +654,7 @@ struct RemoteDocument::Impl {
     RemoteRevision base_revision;
     bool dirty{};
     bool closed{};
+    bool checkpoint_needed{true};
     std::filesystem::path cache_path;
     std::filesystem::path metadata_path;
 
@@ -585,17 +668,38 @@ struct RemoteDocument::Impl {
                 uri.to_string()};
     }
 
-    EditorStatus checkpoint() const {
+    EditorStatus checkpoint() {
+        if (!checkpoint_needed)
+            return EditorStatus::Ok();
         if (cache_path.empty() || metadata_path.empty()) {
             return EditorStatus::Ok();
         }
         const auto content = std::span<const std::byte>(
             reinterpret_cast<const std::byte*>(text.data()), text.size());
-        if (auto status = WriteLocalAtomically(cache_path, content); !status) {
+        // 内容使用不可变的、按哈希命名的代次文件。只有 .meta 的原子替换是提交点；
+        // 新内容写完而元数据提交失败时，旧 .meta 仍能找到完整的旧代次。
+        const auto next_metadata = metadata();
+        const auto next_content =
+            GenerationContentPath(metadata_path, next_metadata.content_sha256);
+        std::error_code content_error;
+        const bool content_already_committed =
+            next_content == cache_path &&
+            std::filesystem::is_regular_file(next_content, content_error) && !content_error;
+        if (!content_already_committed) {
+            if (auto status = WriteLocalAtomically(next_content, content); !status)
+                return status;
+        }
+        const auto metadata_bytes = SerializeMetadata(next_metadata);
+        if (auto status = WriteLocalAtomically(metadata_path, metadata_bytes); !status) {
+            if (next_content != cache_path)
+                (void)RemoveCacheFile(next_content);
             return status;
         }
-        const auto metadata_bytes = SerializeMetadata(metadata());
-        return WriteLocalAtomically(metadata_path, metadata_bytes);
+        const auto previous = std::exchange(cache_path, next_content);
+        if (previous != cache_path)
+            (void)RemoveCacheFile(previous);
+        checkpoint_needed = false;
+        return EditorStatus::Ok();
     }
 };
 
@@ -657,8 +761,8 @@ EditorStatus RemoteDocument::UpdateText(std::string text,
     if (impl_->mode != DocumentMode::Editable) {
         return EditorStatus::Error(EditorErrc::Unsupported, "Document is read-only");
     }
-    if (text.size() > RemoteEditorService::kEditableSizeLimit) {
-        return EditorStatus::Error(EditorErrc::Unsupported, "Edited document exceeds 20 MB");
+    if (text.size() > RemoteEditorService::kInternalTextSizeLimit) {
+        return EditorStatus::Error(EditorErrc::Unsupported, "Internal text exceeds 40 MB");
     }
     const auto next_encoding = encoding.value_or(impl_->encoding);
     std::size_t output_size = text.size();
@@ -675,22 +779,30 @@ EditorStatus RemoteDocument::UpdateText(std::string text,
     }
     if (next_encoding == TextEncoding::Utf8Bom)
         output_size += 3;
-    if (output_size > RemoteEditorService::kEditableSizeLimit) {
+    // 显式切换编码时校验实际输出大小；普通编辑优先保住恢复副本，真正保存时
+    // Materialize 会再次严格限制输出文件大小，绝不因此绕过远端的 20 MB 限制。
+    if (encoding.has_value() && output_size > RemoteEditorService::kEditableSizeLimit) {
         return EditorStatus::Error(EditorErrc::Unsupported, "Edited document exceeds 20 MB");
     }
-    const auto previous = impl_->text;
+    // 快照/当前正文已各占一份，回滚只需转移旧缓冲所有权，不再额外复制整份文件。
+    if (impl_->dirty && next_encoding == impl_->encoding && text == impl_->text)
+        return impl_->checkpoint();
+    auto previous = std::move(impl_->text);
     const auto previous_encoding = impl_->encoding;
     const auto previous_eol = impl_->eol;
     const bool previous_dirty = impl_->dirty;
+    const bool previous_checkpoint_needed = impl_->checkpoint_needed;
     impl_->text = std::move(text);
     impl_->encoding = next_encoding;
     impl_->eol = DetectEol(impl_->text);
     impl_->dirty = true;
+    impl_->checkpoint_needed = true;
     if (auto status = impl_->checkpoint(); !status) {
-        impl_->text = previous;
+        impl_->text = std::move(previous);
         impl_->encoding = previous_encoding;
         impl_->eol = previous_eol;
         impl_->dirty = previous_dirty;
+        impl_->checkpoint_needed = previous_checkpoint_needed;
         return status;
     }
     return EditorStatus::Ok();
@@ -789,6 +901,7 @@ EditorResult<SaveResult> RemoteDocument::Save(const SaveMode mode) {
     impl_->dirty = false;
     // 步骤 5：远端成功后把 dirty=false 写入恢复元数据。即使该本地 checkpoint 失败，
     // 也不重复上传，只把缓存错误返回给 UI 处理。
+    impl_->checkpoint_needed = true;
     if (auto status = impl_->checkpoint(); !status) {
         return EditorResult<SaveResult>::Failure(std::move(status));
     }
@@ -810,6 +923,23 @@ EditorResult<SaveResult> RemoteDocument::SaveAs(FileUri target, const bool repla
     }
     if (target == impl_->uri) {
         return Save(replace_existing ? SaveMode::OverwriteRemote : SaveMode::CheckForConflict);
+    }
+
+    const auto stem = CacheStem(target);
+    auto target_lease = DocumentCacheLease::Acquire(impl_->cache_lease->registry, stem);
+    if (!target_lease) {
+        return EditorResult<SaveResult>::Failure(EditorStatus::Error(
+            EditorErrc::InvalidArgument, "Save As target is already open in another document"));
+    }
+    const auto target_metadata = impl_->metadata_path.parent_path() / (stem + ".meta");
+    if (std::filesystem::exists(target_metadata)) {
+        auto bytes = ReadLocalFile(target_metadata, kMaxMetadataBytes);
+        auto metadata = bytes ? DeserializeMetadata(bytes.value())
+                              : EditorResult<CacheMetadata>::Failure(bytes.status());
+        if (!metadata || metadata.value().dirty) {
+            return EditorResult<SaveResult>::Failure(EditorStatus::Error(
+                EditorErrc::InvalidArgument, "Save As target has recovery data; open it first"));
+        }
     }
 
     try {
@@ -861,16 +991,28 @@ EditorResult<SaveResult> RemoteDocument::SaveAs(FileUri target, const bool repla
 
     const auto old_cache_path = impl_->cache_path;
     const auto old_metadata_path = impl_->metadata_path;
+    const auto old_uri = impl_->uri;
+    const auto old_revision = impl_->base_revision;
+    const bool old_dirty = impl_->dirty;
+    const bool old_checkpoint_needed = impl_->checkpoint_needed;
     const auto cache_dir = old_cache_path.parent_path();
     impl_->uri = std::move(target);
     impl_->base_revision = ToRevision(saved_stat, Sha256(bytes));
     impl_->dirty = false;
-    const auto stem = CacheStem(impl_->uri);
     impl_->cache_path = cache_dir / (stem + ".content");
     impl_->metadata_path = cache_dir / (stem + ".meta");
+    impl_->checkpoint_needed = true;
     if (auto status = impl_->checkpoint(); !status) {
+        // 远端可能已写入，但本地身份只有在新缓存完整落盘后才提交。
+        impl_->uri = old_uri;
+        impl_->base_revision = old_revision;
+        impl_->dirty = old_dirty;
+        impl_->cache_path = old_cache_path;
+        impl_->metadata_path = old_metadata_path;
+        impl_->checkpoint_needed = old_checkpoint_needed;
         return EditorResult<SaveResult>::Failure(std::move(status));
     }
+    impl_->cache_lease = std::move(target_lease);
     if (old_cache_path != impl_->cache_path) {
         RemoveCacheFile(old_cache_path);
     }
@@ -890,6 +1032,7 @@ EditorStatus RemoteDocument::Close() {
             return status;
         }
         impl_->closed = true;
+        impl_->cache_lease.reset();
         return EditorStatus::Ok();
     }
     const auto content_status = RemoveCacheFile(impl_->cache_path);
@@ -899,6 +1042,7 @@ EditorStatus RemoteDocument::Close() {
     if (!metadata_status)
         return metadata_status;
     impl_->closed = true;
+    impl_->cache_lease.reset();
     return EditorStatus::Ok();
 }
 
@@ -913,6 +1057,7 @@ EditorStatus RemoteDocument::DiscardChanges() {
         impl_->dirty = was_dirty;
         if (was_dirty) {
             // 删除缓存只完成一半时，尽量恢复可供崩溃恢复的原始修改。
+            impl_->checkpoint_needed = true;
             (void)impl_->checkpoint();
         }
     }
@@ -920,13 +1065,39 @@ EditorStatus RemoteDocument::DiscardChanges() {
 }
 
 RemoteEditorService::RemoteEditorService(const storage::AppPaths& paths)
-    : cache_dir_(paths.editor_cache_dir().lexically_normal()) {}
+    : cache_dir_(paths.editor_cache_dir().lexically_normal()),
+      cache_registry_(RegistryFor(cache_dir_)) {}
 
 EditorResult<std::unique_ptr<RemoteDocument>>
 RemoteEditorService::Open(std::shared_ptr<IFileEndpoint> endpoint, FileUri uri) const {
     if (!endpoint || !endpoint->available() || !endpoint->accepts(uri)) {
         return EditorResult<std::unique_ptr<RemoteDocument>>::Failure(
             EditorStatus::Error(EditorErrc::InvalidArgument, "Endpoint cannot open this URI"));
+    }
+
+    // 正常关闭未保存标签后再次打开，直接恢复本地修改；不覆盖服务器文件。
+    // 在读取远端前检查，远端文件被删除时仍能取回自己的未保存内容。
+    const auto stem = CacheStem(uri);
+    const auto metadata_path = cache_dir_ / (stem + ".meta");
+    if (std::filesystem::exists(metadata_path)) {
+        auto bytes = ReadLocalFile(metadata_path, kMaxMetadataBytes);
+        if (bytes) {
+            auto metadata = DeserializeMetadata(bytes.value());
+            if (metadata && metadata.value().dirty && metadata.value().uri == uri.to_string()) {
+                return Recover(endpoint,
+                               {uri,
+                                CommittedContentPath(metadata_path, metadata.value()),
+                                metadata_path,
+                                metadata.value().encoding,
+                                metadata.value().eol,
+                                metadata.value().revision});
+            }
+        }
+    }
+    auto lease = DocumentCacheLease::Acquire(cache_registry_, stem);
+    if (!lease) {
+        return EditorResult<std::unique_ptr<RemoteDocument>>::Failure(
+            EditorStatus::Error(EditorErrc::InvalidArgument, "Document is already open"));
     }
 
     FileStat initial_stat;
@@ -941,6 +1112,7 @@ RemoteEditorService::Open(std::shared_ptr<IFileEndpoint> endpoint, FileUri uri) 
     }
 
     auto impl = std::make_unique<RemoteDocument::Impl>();
+    impl->cache_lease = std::move(lease);
     impl->endpoint = std::move(endpoint);
     impl->uri = std::move(uri);
     impl->base_revision = ToRevision(initial_stat);
@@ -983,7 +1155,6 @@ RemoteEditorService::Open(std::shared_ptr<IFileEndpoint> endpoint, FileUri uri) 
     impl->encoding = info.encoding;
     impl->eol = info.eol;
     impl->text = std::move(info.text);
-    const auto stem = CacheStem(impl->uri);
     impl->cache_path = cache_dir_ / (stem + ".content");
     impl->metadata_path = cache_dir_ / (stem + ".meta");
 
@@ -1017,6 +1188,9 @@ EditorResult<std::vector<RecoveryEntry>> RemoteEditorService::RecoverableDocumen
         if (!item.is_regular_file() || item.path().extension() != L".meta") {
             continue;
         }
+        auto lease = DocumentCacheLease::Acquire(cache_registry_, item.path().stem().string());
+        if (!lease)
+            continue; // 正在使用的缓存既不清理，也不重复恢复。
         auto bytes = ReadLocalFile(item.path(), kMaxMetadataBytes);
         if (!bytes) {
             continue;
@@ -1025,8 +1199,7 @@ EditorResult<std::vector<RecoveryEntry>> RemoteEditorService::RecoverableDocumen
         if (!metadata) {
             continue;
         }
-        auto content_path = item.path();
-        content_path.replace_extension(L".content");
+        auto content_path = CommittedContentPath(item.path(), metadata.value());
         if (!metadata.value().dirty) {
             std::filesystem::remove(content_path, error);
             error.clear();
@@ -1038,7 +1211,7 @@ EditorResult<std::vector<RecoveryEntry>> RemoteEditorService::RecoverableDocumen
             error.clear();
             continue;
         }
-        auto content = ReadLocalFile(content_path, kEditableSizeLimit);
+        auto content = ReadLocalFile(content_path, kInternalTextSizeLimit);
         if (!content || content.value().size() != metadata.value().content_size ||
             Sha256(content.value()) != metadata.value().content_sha256) {
             continue;
@@ -1065,11 +1238,16 @@ RemoteEditorService::Recover(std::shared_ptr<IFileEndpoint> endpoint,
     if (!endpoint || !endpoint->available() || !endpoint->accepts(entry.uri) ||
         !IsDirectCacheChild(cache_dir_, entry.content_path) ||
         !IsDirectCacheChild(cache_dir_, entry.metadata_path) ||
-        entry.content_path.stem() != entry.metadata_path.stem() ||
+        entry.metadata_path.stem().string() != CacheStem(entry.uri) ||
         entry.content_path.extension() != L".content" ||
         entry.metadata_path.extension() != L".meta") {
         return EditorResult<std::unique_ptr<RemoteDocument>>::Failure(
             EditorStatus::Error(EditorErrc::InvalidArgument, "Invalid recovery entry"));
+    }
+    auto lease = DocumentCacheLease::Acquire(cache_registry_, entry.metadata_path.stem().string());
+    if (!lease) {
+        return EditorResult<std::unique_ptr<RemoteDocument>>::Failure(
+            EditorStatus::Error(EditorErrc::InvalidArgument, "Document is already open"));
     }
     auto metadata_bytes = ReadLocalFile(entry.metadata_path, kMaxMetadataBytes);
     if (!metadata_bytes) {
@@ -1080,7 +1258,10 @@ RemoteEditorService::Recover(std::shared_ptr<IFileEndpoint> endpoint,
         return EditorResult<std::unique_ptr<RemoteDocument>>::Failure(
             EditorStatus::Error(EditorErrc::CorruptCache, "Recovery metadata does not match"));
     }
-    auto content = ReadLocalFile(entry.content_path, kEditableSizeLimit);
+    if (entry.content_path != CommittedContentPath(entry.metadata_path, metadata.value()))
+        return EditorResult<std::unique_ptr<RemoteDocument>>::Failure(EditorStatus::Error(
+            EditorErrc::CorruptCache, "Recovery content generation does not match"));
+    auto content = ReadLocalFile(entry.content_path, kInternalTextSizeLimit);
     if (!content || content.value().size() != metadata.value().content_size ||
         Sha256(content.value()) != metadata.value().content_sha256) {
         return EditorResult<std::unique_ptr<RemoteDocument>>::Failure(
@@ -1088,6 +1269,7 @@ RemoteEditorService::Recover(std::shared_ptr<IFileEndpoint> endpoint,
     }
 
     auto impl = std::make_unique<RemoteDocument::Impl>();
+    impl->cache_lease = std::move(lease);
     impl->endpoint = std::move(endpoint);
     impl->uri = entry.uri;
     impl->encoding = metadata.value().encoding;
@@ -1096,6 +1278,8 @@ RemoteEditorService::Recover(std::shared_ptr<IFileEndpoint> endpoint,
     impl->dirty = true;
     impl->cache_path = entry.content_path;
     impl->metadata_path = entry.metadata_path;
+    // 内容和元数据刚经哈希校验，关闭时无需再次写入同一份已提交恢复记录。
+    impl->checkpoint_needed = false;
     impl->text.assign(
         reinterpret_cast<const char*>(content.value().data()),
         reinterpret_cast<const char*>(content.value().data() + content.value().size()));

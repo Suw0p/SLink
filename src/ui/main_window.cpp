@@ -137,6 +137,8 @@ struct MainWindow::Impl {
     std::mutex ui_task_mutex;
     std::deque<std::function<void()>> ui_tasks;
     std::function<void()> server_manager_callback;
+    std::function<void(std::function<void(bool)>)> close_request_callback;
+    bool close_pending{};
     std::function<bool(theme::Mode)> theme_changed_callback;
     theme::Mode selected_theme{theme::CurrentMode()};
     int title_bar_height{};
@@ -349,7 +351,36 @@ struct MainWindow::Impl {
         case WM_ERASEBKGND:
             return 1;
         case WM_CLOSE:
-            DestroyWindow(window);
+            if (self->close_pending)
+                return 0;
+            if (self->close_request_callback) {
+                self->close_pending = true;
+                // 检查期间冻结交互，但继续泵消息，后台保存/认证及 UI 完成事件可正常结束。
+                EnableWindow(window, FALSE);
+                try {
+                    self->close_request_callback([self, window](bool allowed) {
+                        if (!self->close_pending)
+                            return;
+                        self->close_pending = false;
+                        EnableWindow(window, TRUE);
+                        if (allowed) {
+                            ShowWindow(window, SW_HIDE);
+                            PostQuitMessage(0);
+                        }
+                    });
+                } catch (...) {
+                    self->close_pending = false;
+                    EnableWindow(window, TRUE);
+                    MessageBoxW(window,
+                                L"无法保存退出快照，窗口已保留，请重试。",
+                                L"SLink",
+                                MB_OK | MB_ICONERROR);
+                }
+                return 0;
+            }
+            // 先结束消息循环，让 Application 按依赖顺序保存编辑缓冲、停止网络任务。
+            // HWND 由 MainWindow 析构最后销毁，不能在正文快照之前销毁 Scintilla。
+            ShowWindow(window, SW_HIDE);
             PostQuitMessage(0);
             return 0;
         case WM_DESTROY:
@@ -1597,6 +1628,10 @@ void MainWindow::SetServerManagerCallback(std::function<void()> callback) {
     impl_->server_manager_callback = std::move(callback);
 }
 
+void MainWindow::SetCloseRequestCallback(std::function<void(std::function<void(bool)>)> callback) {
+    impl_->close_request_callback = std::move(callback);
+}
+
 void MainWindow::SetServerSidebarItems(std::vector<ServerSidebarGroup> groups,
                                        std::vector<ServerSidebarItem> servers) {
     std::ranges::sort(groups, [](const ServerSidebarGroup& left, const ServerSidebarGroup& right) {
@@ -1638,8 +1673,8 @@ void MainWindow::SetCollapsedServerGroups(
     impl_->PopulateServerList();
 }
 
-void MainWindow::SetServerUngroupedPreference(
-    const bool ungrouped, std::function<bool(bool)> changed_callback) {
+void MainWindow::SetServerUngroupedPreference(const bool ungrouped,
+                                              std::function<bool(bool)> changed_callback) {
     impl_->server_ungrouped = ungrouped;
     impl_->server_ungrouped_changed = std::move(changed_callback);
     impl_->PopulateServerList(true);

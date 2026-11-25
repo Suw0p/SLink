@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <condition_variable>
 #include <cstdint>
+#include <list>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -19,6 +21,7 @@ struct EditorWorkScheduler::Impl {
         std::chrono::steady_clock::time_point due;
         std::uint64_t sequence{};
         std::string lane;
+        std::string key;
         std::function<void()> action;
     };
 
@@ -26,7 +29,8 @@ struct EditorWorkScheduler::Impl {
     std::vector<std::jthread> workers;
     std::mutex mutex;
     std::condition_variable ready;
-    std::vector<WorkItem> work;
+    std::list<WorkItem> work;
+    std::unordered_map<std::string, std::list<WorkItem>::iterator> latest;
     std::unordered_set<std::string> busy_lanes;
     std::uint64_t next_sequence{};
     bool stopping{};
@@ -94,6 +98,8 @@ struct EditorWorkScheduler::Impl {
                     }
                     lane = std::move(runnable->lane);
                     action = std::move(runnable->action);
+                    if (!runnable->key.empty())
+                        latest.erase(runnable->key);
                     work.erase(runnable);
                     busy_lanes.insert(lane);
                     break;
@@ -119,21 +125,65 @@ struct EditorWorkScheduler::Impl {
     }
 
     void Stop() {
+        std::list<WorkItem> cancelled;
         {
             std::scoped_lock lock(mutex);
             if (stopping) {
                 return;
             }
             stopping = true;
-            work.clear();
+            work.swap(cancelled);
+            latest.clear();
         }
         for (auto& worker : workers) {
             worker.request_stop();
         }
         ready.notify_all();
+        cancelled.clear(); // 捕获的快照/端点在锁外释放。
         for (auto& worker : workers) {
             worker.join();
         }
+    }
+
+    void Enqueue(std::string lane,
+                 std::string key,
+                 std::function<void()> action,
+                 std::chrono::milliseconds delay) {
+        if (!action)
+            return;
+        std::function<void()> replaced;
+        {
+            std::scoped_lock lock(mutex);
+            if (stopping)
+                return;
+            const auto due = std::chrono::steady_clock::now() + delay;
+            const auto found = key.empty() ? latest.end() : latest.find(key);
+            if (found != latest.end()) {
+                auto& item = *found->second;
+                replaced = std::move(item.action);
+                item.action = std::move(action);
+                item.lane = std::move(lane);
+                item.due = due;
+                item.sequence = next_sequence++;
+            } else {
+                auto item = work.emplace(work.end(),
+                                         due,
+                                         next_sequence++,
+                                         std::move(lane),
+                                         std::move(key),
+                                         std::move(action));
+                if (!item->key.empty()) {
+                    try {
+                        latest.emplace(item->key, item);
+                    } catch (...) {
+                        replaced = std::move(item->action);
+                        work.erase(item);
+                        throw;
+                    }
+                }
+            }
+        }
+        ready.notify_all();
     }
 };
 
@@ -147,20 +197,35 @@ EditorWorkScheduler::~EditorWorkScheduler() {
 void EditorWorkScheduler::Enqueue(std::string lane,
                                   std::function<void()> action,
                                   std::chrono::milliseconds delay) {
-    if (!action) {
-        return;
-    }
+    impl_->Enqueue(std::move(lane), {}, std::move(action), delay);
+}
+
+void EditorWorkScheduler::EnqueueLatest(std::string lane,
+                                        std::string key,
+                                        std::function<void()> action,
+                                        std::chrono::milliseconds delay) {
+    if (key.empty())
+        throw std::invalid_argument("Coalesced editor task requires a key");
+    impl_->Enqueue(std::move(lane), std::move(key), std::move(action), delay);
+}
+
+void EditorWorkScheduler::CancelLatest(const std::string& key) {
+    std::function<void()> cancelled;
     {
         std::scoped_lock lock(impl_->mutex);
-        if (impl_->stopping) {
+        const auto found = impl_->latest.find(key);
+        if (found == impl_->latest.end())
             return;
-        }
-        impl_->work.push_back({std::chrono::steady_clock::now() + delay,
-                               impl_->next_sequence++,
-                               std::move(lane),
-                               std::move(action)});
+        cancelled = std::move(found->second->action);
+        impl_->work.erase(found->second);
+        impl_->latest.erase(found);
     }
     impl_->ready.notify_all();
+}
+
+std::size_t EditorWorkScheduler::pending_count() const {
+    std::scoped_lock lock(impl_->mutex);
+    return impl_->work.size();
 }
 
 void EditorWorkScheduler::Stop() {

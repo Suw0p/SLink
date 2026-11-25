@@ -89,6 +89,7 @@ struct UiElement {
     bool visible{true};
     bool status_online{};
     bool compact_text{};
+    float text_right_inset{};
 };
 
 class UiSurface final {

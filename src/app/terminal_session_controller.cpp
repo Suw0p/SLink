@@ -361,8 +361,10 @@ Status RunTerminalSession(PaneSession& pane,
         authentication_status = session->authenticate(ssh::AgentAuth{authentication.username});
         break;
     case TerminalAuthentication::Mode::keyboard_interactive:
-        authentication_status = session->authenticate(
-            ssh::KeyboardInteractiveAuth{authentication.username, authentication.keyboard_respond});
+        authentication_status = session->authenticate(ssh::KeyboardInteractiveAuth{
+            authentication.username, authentication.keyboard_respond, [cancellation] {
+                return cancellation.is_cancelled();
+            }});
         break;
     }
     authentication.secret.clear();
@@ -559,10 +561,10 @@ struct TerminalSessionController::Impl {
         return it == sessions.end() ? nullptr : it->get();
     }
 
-    void NotifyState(PaneSession& pane, const ui::ViewPhase phase,
-                     std::wstring message = {}) {
+    void NotifyState(PaneSession& pane, const ui::ViewPhase phase, std::wstring message = {}) {
         if (state_callback) {
-            state_callback(*pane.terminal, {phase, std::move(message), ui::ViewRecoveryAction::None});
+            state_callback(*pane.terminal,
+                           {phase, std::move(message), ui::ViewRecoveryAction::None});
         }
     }
 
@@ -610,10 +612,8 @@ struct TerminalSessionController::Impl {
         const std::uint64_t generation = ++pane.generation;
         NotifyState(pane, ui::ViewPhase::Connecting);
         const std::weak_ptr<int> weak_lifetime = callback_lifetime;
-        auto notify_state = [this,
-                             weak_lifetime,
-                             terminal = pane.terminal,
-                             generation](const ui::ViewPhase phase) {
+        auto notify_state = [this, weak_lifetime, terminal = pane.terminal, generation](
+                                const ui::ViewPhase phase) {
             ui_dispatcher->post([this, weak_lifetime, terminal, generation, phase] {
                 if (weak_lifetime.expired()) {
                     return;
@@ -639,8 +639,8 @@ struct TerminalSessionController::Impl {
                  authentication = std::move(authentication_data),
                  owner = owner,
                  reconnecting,
-                 notify_state = std::move(notify_state)](
-                    const ssh::CancellationToken& cancellation) mutable {
+                 notify_state =
+                     std::move(notify_state)](const ssh::CancellationToken& cancellation) mutable {
                     return RunTerminalSession(*pane_pointer,
                                               *reactor,
                                               cancellation,
@@ -653,8 +653,8 @@ struct TerminalSessionController::Impl {
                                               reconnecting,
                                               notify_state);
                 },
-                [this, weak_lifetime, terminal = pane.terminal,
-                 generation](ssh::ReactorTaskResult result) {
+                [this, weak_lifetime, terminal = pane.terminal, generation](
+                    ssh::ReactorTaskResult result) {
                     if (weak_lifetime.expired()) {
                         return;
                     }
@@ -737,16 +737,16 @@ void TerminalSessionController::Connect(ui::TerminalControl& terminal,
     if (!ssh::libssh2_enabled()) {
         FeedStatus(&terminal, L"此构建未启用 libssh2，无法建立真实 SSH 连接。", true);
         if (impl_->state_callback) {
-            impl_->state_callback(terminal,
-                                  {ui::ViewPhase::Error, L"未启用 SSH", ui::ViewRecoveryAction::None});
+            impl_->state_callback(
+                terminal, {ui::ViewPhase::Error, L"未启用 SSH", ui::ViewRecoveryAction::None});
         }
         return;
     }
     if (!impl_->authentication_provider) {
         FeedStatus(&terminal, L"没有可用的安全认证提供器。", true);
         if (impl_->state_callback) {
-            impl_->state_callback(terminal, {ui::ViewPhase::Error, L"无认证提供器",
-                                             ui::ViewRecoveryAction::None});
+            impl_->state_callback(
+                terminal, {ui::ViewPhase::Error, L"无认证提供器", ui::ViewRecoveryAction::None});
         }
         return;
     }
@@ -818,8 +818,8 @@ void TerminalSessionController::ConnectLocalCmd(ui::TerminalControl& terminal) {
     if (const Status status = session->Start(); !status) {
         FeedStatus(&terminal, status.message(), true);
         if (impl_->state_callback) {
-            impl_->state_callback(terminal, {ui::ViewPhase::Error, status.message(),
-                                             ui::ViewRecoveryAction::None});
+            impl_->state_callback(
+                terminal, {ui::ViewPhase::Error, status.message(), ui::ViewRecoveryAction::None});
         }
         return;
     }

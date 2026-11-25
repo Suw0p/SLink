@@ -8,6 +8,7 @@
 #include "ui/retained_ui.hpp"
 #include "ui/selector_control.hpp"
 #include "ui/table_control.hpp"
+#include "ui/terminal_tab_viewport.hpp"
 #include "ui/win32_ui_internal.hpp"
 
 #include <algorithm>
@@ -44,6 +45,9 @@ constexpr int kDismissConflictId = 4114;
 constexpr int kPathEditId = 4119;
 constexpr int kPathRefreshId = 4120;
 constexpr int kEncodingSelectorId = 4121;
+constexpr int kTabPreviousId = 4122;
+constexpr int kTabNextId = 4123;
+constexpr int kStatusDetailsId = 4124;
 constexpr int kDocumentTabFirstId = 4500;
 constexpr int kDocumentCloseFirstId = 5500;
 constexpr UINT kUpdateHorizontalScrollbarMessage = WM_APP + 0x231;
@@ -68,6 +72,15 @@ constexpr UINT kSciStyleSetBold = 2053;
 constexpr UINT kSciStyleSetFont = 2056;
 constexpr UINT kSciStyleSetSize = 2055;
 constexpr UINT kSciSetCaretFore = 2069;
+constexpr UINT kSciSetSelBack = 2068;
+constexpr UINT kSciSetSelAlpha = 2478;
+constexpr UINT kSciSetCaretLineVisible = 2096;
+constexpr UINT kSciSetCaretLineBack = 2098;
+constexpr UINT kSciSetCaretLineBackAlpha = 2470;
+constexpr UINT kSciSetMarginLeft = 2155;
+constexpr UINT kSciSetMarginRight = 2157;
+constexpr UINT kSciSetExtraAscent = 2526;
+constexpr UINT kSciSetExtraDescent = 2528;
 constexpr UINT kSciSetMarginWidthN = 2242;
 constexpr UINT kSciGetMarginWidthN = 2243;
 constexpr UINT kSciGetMargins = 2253;
@@ -306,6 +319,9 @@ void InvokeSafely(const Callback& callback, Args&&... args) noexcept {
 LRESULT CALLBACK PathFrameWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
     case WM_COMMAND:
+        if (HIWORD(wparam) == EN_SETFOCUS || HIWORD(wparam) == EN_KILLFOCUS)
+            InvalidateRect(window, nullptr, FALSE);
+        [[fallthrough]];
     case WM_NOTIFY:
         return SendMessageW(GetParent(window), message, wparam, lparam);
     case WM_CTLCOLOREDIT: {
@@ -325,7 +341,10 @@ LRESULT CALLBACK PathFrameWindowProc(HWND window, UINT message, WPARAM wparam, L
         const int diameter = detail::ScaleForDpi(7, dpi);
         const HBRUSH fill = CreateSolidBrush(detail::kPanelAltColor);
         const HPEN border =
-            CreatePen(PS_SOLID, std::max(1, detail::ScaleForDpi(1, dpi)), detail::kBorderColor);
+            CreatePen(PS_SOLID,
+                      std::max(1, detail::ScaleForDpi(1, dpi)),
+                      GetFocus() == GetWindow(window, GW_CHILD) ? detail::kAccentColor
+                                                                : detail::kPanelAltColor);
         const HGDIOBJ old_brush = SelectObject(dc, fill);
         const HGDIOBJ old_pen = SelectObject(dc, border);
         RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, diameter, diameter);
@@ -437,6 +456,7 @@ struct EditorPage::Impl {
         bool read_only{};
         bool dirty{};
         bool saving{};
+        bool closing{};
         bool preview_truncated{};
         std::wstring conflict;
     };
@@ -477,12 +497,19 @@ struct EditorPage::Impl {
     HWND editor_vertical_scrollbar{};
     HWND preview{};
     HWND status_bar{};
+    HWND status_details{};
+    HWND tooltip{};
+    std::wstring tooltip_text;
+    std::size_t first_tab{}, visible_tabs{}, previous_tab_count{};
+    int previous_tab_room{};
+    std::optional<EditorDocumentId> previous_tab_active;
     HWND resize_guide{};
     HMODULE scintilla_module{};
     HMODULE lexilla_module{};
     HFONT font{};
     HFONT title_font{};
     HFONT mono_font{};
+    HFONT caption_font{};
     bool conflict_visible{};
     bool scintilla_available{};
     bool loading_document{};
@@ -641,6 +668,45 @@ struct EditorPage::Impl {
             }
             break;
         case WM_NOTIFY:
+            if (self->tooltip && reinterpret_cast<NMHDR*>(lparam)->hwndFrom == self->tooltip &&
+                reinterpret_cast<NMHDR*>(lparam)->code == TTN_GETDISPINFOW) {
+                auto* info = reinterpret_cast<NMTTDISPINFOW*>(lparam);
+                self->tooltip_text.clear();
+                const auto* document = self->ActiveDocument();
+                if (document) {
+                    self->tooltip_text = document->server_name;
+                    if (!document->remote_path.empty())
+                        self->tooltip_text += L"\n" + document->remote_path;
+                }
+                POINT point{};
+                GetCursorPos(&point);
+                ScreenToClient(window, &point);
+                if (info->hdr.idFrom == reinterpret_cast<UINT_PTR>(window)) {
+                    self->tooltip_text.clear();
+                    for (const auto& element : self->surface.elements()) {
+                        if (element.role == detail::UiRole::file_tab &&
+                            point.x >= element.bounds.left && point.x < element.bounds.right &&
+                            point.y >= element.bounds.top && point.y < element.bounds.bottom) {
+                            const auto index =
+                                static_cast<std::size_t>(element.id - kDocumentTabFirstId);
+                            if (index < self->documents.size()) {
+                                const auto& item = self->documents[index];
+                                self->tooltip_text =
+                                    item.server_name + L"\n" +
+                                    (item.remote_path.empty() ? item.title : item.remote_path);
+                            }
+                        }
+                        if (element.id == kSaveId && point.x >= element.bounds.left &&
+                            point.x < element.bounds.right && point.y >= element.bounds.top &&
+                            point.y < element.bounds.bottom)
+                            self->tooltip_text = L"保存 · Ctrl+S";
+                    }
+                }
+                if (info->hdr.idFrom == reinterpret_cast<UINT_PTR>(self->path_edit))
+                    self->tooltip_text = WindowText(self->path_edit);
+                info->lpszText = self->tooltip_text.data();
+                return 0;
+            }
             if (const auto* header = reinterpret_cast<const NMHDR*>(lparam);
                 header && self->HandleNotify(*header)) {
                 return 0;
@@ -650,6 +716,13 @@ struct EditorPage::Impl {
         case WM_CTLCOLOREDIT:
         case WM_CTLCOLORLISTBOX: {
             const HDC dc = reinterpret_cast<HDC>(wparam);
+            if (reinterpret_cast<HWND>(lparam) == self->status_bar ||
+                reinterpret_cast<HWND>(lparam) == self->status_details) {
+                SetTextColor(dc, detail::kMutedTextColor);
+                SetBkColor(dc, theme::TerminalBackgroundColor());
+                return reinterpret_cast<LRESULT>(theme::IsDark() ? detail::WindowThemeBrush()
+                                                                 : detail::PanelThemeBrush());
+            }
             SetTextColor(dc, detail::kTextColor);
             SetBkColor(dc, detail::kPanelColor);
             return reinterpret_cast<LRESULT>(detail::PanelThemeBrush());
@@ -837,7 +910,7 @@ struct EditorPage::Impl {
     void ChangeEncoding() {
         auto* document = ActiveDocument();
         if (!document || document->kind != EditorDocumentKind::Text || document->read_only ||
-            document->saving) {
+            document->saving || document->closing) {
             return;
         }
         const auto target = SendMessageW(encoding_selector, CB_GETCURSEL, 0, 0) == 1
@@ -1323,9 +1396,14 @@ struct EditorPage::Impl {
     void ConfigureScintilla() const {
         const bool dark = theme::IsDark();
         const COLORREF editor_background = theme::TerminalBackgroundColor();
-        const COLORREF margin_background = theme::kPanelColor;
-        const COLORREF margin_foreground = theme::kMutedTextColor;
-        SendMessageW(editor, kSciSetCodePage, kScCpUtf8, 0);
+        const COLORREF margin_background = editor_background;
+        const COLORREF margin_foreground = dark ? RGB(105, 108, 115) : RGB(135, 139, 146);
+        const auto* document = ActiveDocument();
+        SendMessageW(editor,
+                     kSciSetCodePage,
+                     document && document->encoding == EditorTextEncoding::Legacy8Bit ? 0
+                                                                                      : kScCpUtf8,
+                     0);
         SendMessageW(editor, kSciStyleSetFore, kStyleDefault, theme::kTextColor);
         SendMessageW(editor, kSciStyleSetBack, kStyleDefault, editor_background);
         SendMessageA(editor, kSciStyleSetFont, kStyleDefault, reinterpret_cast<LPARAM>("Consolas"));
@@ -1337,7 +1415,19 @@ struct EditorPage::Impl {
         SendMessageA(
             editor, kSciStyleSetFont, kStyleLineNumber, reinterpret_cast<LPARAM>("Consolas"));
         SendMessageW(editor, kSciStyleSetSize, kStyleLineNumber, 9);
-        SendMessageW(editor, kSciSetCaretFore, dark ? RGB(92, 207, 130) : RGB(0, 95, 184), 0);
+        SendMessageW(editor, kSciSetCaretFore, theme::kTextColor, 0);
+        SendMessageW(editor, kSciSetSelBack, TRUE, dark ? RGB(70, 91, 125) : RGB(188, 208, 236));
+        SendMessageW(editor, kSciSetSelAlpha, 150, 0);
+        SendMessageW(editor, kSciSetCaretLineVisible, TRUE, 0);
+        SendMessageW(editor, kSciSetCaretLineBack, dark ? RGB(43, 45, 49) : RGB(237, 240, 244), 0);
+        SendMessageW(editor, kSciSetCaretLineBackAlpha, 120, 0);
+        SendMessageW(editor, kSciSetMarginLeft, 0, detail::ScaleForDpi(8, detail::WindowDpi(hwnd)));
+        SendMessageW(
+            editor, kSciSetMarginRight, 0, detail::ScaleForDpi(8, detail::WindowDpi(hwnd)));
+        SendMessageW(
+            editor, kSciSetExtraAscent, detail::ScaleForDpi(1, detail::WindowDpi(hwnd)), 0);
+        SendMessageW(
+            editor, kSciSetExtraDescent, detail::ScaleForDpi(1, detail::WindowDpi(hwnd)), 0);
         if (!active_id) {
             SendMessageW(editor, kSciSetScrollWidth, 1, 0);
         }
@@ -1436,6 +1526,7 @@ struct EditorPage::Impl {
         const auto* document = ActiveDocument();
         if (!document) {
             SetWindowTextW(status_bar, L"未打开文件");
+            SetWindowTextW(status_details, L"");
             return;
         }
         std::wstring status;
@@ -1450,35 +1541,36 @@ struct EditorPage::Impl {
             status.append(EolLabel(document->eol));
             status.append(L" • 大文件只读（超过 20 MB）");
         } else {
-            status = EncodingLabel(document->encoding);
-            status.append(L" • ");
-            status.append(EolLabel(document->eol));
-            status.append(document->read_only ? L" • 只读" : L" • 可编辑");
-            if (document->dirty) {
-                status.append(L" • 已修改");
-            }
             if (scintilla_available && editor && IsWindowVisible(editor)) {
                 const LRESULT position = SendMessageW(editor, kSciGetCurrentPos, 0, 0);
                 const LRESULT line = SendMessageW(editor, kSciLineFromPosition, position, 0);
                 const LRESULT column = SendMessageW(editor, kSciGetColumn, position, 0);
-                status.append(L" • 行 ");
+                status.append(L"行 ");
                 status.append(std::to_wstring(line + 1));
                 status.append(L"，列 ");
                 status.append(std::to_wstring(column + 1));
             }
+            if (!status.empty())
+                status += L" · ";
+            status += EolLabel(document->eol);
+            if (document->read_only)
+                status += L" · 只读";
+            else if (document->dirty)
+                status += L" · 已修改";
+            if (document->read_only || document->encoding == EditorTextEncoding::Utf8Bom ||
+                document->encoding == EditorTextEncoding::Legacy8Bit)
+                status += L" · " + EncodingLabel(document->encoding);
         }
-        if (document->saving) {
+        if (document->closing) {
+            status.append(L" • 正在保留恢复缓存…");
+        } else if (document->saving) {
             status.append(L" • 正在保存…");
         }
-        if (!document->server_name.empty()) {
-            std::wstring location = L"服务器 " + document->server_name;
-            if (!document->title.empty()) {
-                location.append(L" · ");
-                location.append(document->title);
-            }
-            status.insert(0, location + L"  |  ");
-        }
-        SetWindowTextW(status_bar, status.c_str());
+        const std::wstring location = document->server_name.empty()
+                                          ? document->title
+                                          : document->server_name + L" · " + document->title;
+        SetWindowTextW(status_bar, location.c_str());
+        SetWindowTextW(status_details, status.c_str());
     }
 
     void UpdateConflictBar() {
@@ -1496,7 +1588,7 @@ struct EditorPage::Impl {
             const bool editable =
                 document && document->kind == EditorDocumentKind::Text && !document->read_only;
             ShowWindow(encoding_selector, editable ? SW_SHOWNOACTIVATE : SW_HIDE);
-            EnableWindow(encoding_selector, editable && !document->saving);
+            EnableWindow(encoding_selector, editable && !document->saving && !document->closing);
             if (editable) {
                 SendMessageW(encoding_selector,
                              CB_SETCURSEL,
@@ -1519,10 +1611,12 @@ struct EditorPage::Impl {
                 SendMessageW(editor, kSciSetReadOnly, TRUE, 0);
                 SendMessageW(editor, kSciSetHScrollBar, FALSE, 0);
                 SendMessageW(editor, kSciSetVScrollBar, FALSE, 0);
+                ShowWindow(editor, SW_HIDE);
             } else {
                 ShowWindow(editor, SW_HIDE);
                 ShowWindow(preview, SW_SHOW);
                 SetWindowTextW(preview, L"");
+                ShowWindow(preview, SW_HIDE);
             }
         } else {
             if (scintilla_available) {
@@ -1564,7 +1658,8 @@ struct EditorPage::Impl {
                 SendMessageW(editor, kSciSetSavePoint, 0, 0);
                 SendMessageW(editor,
                              kSciSetReadOnly,
-                             document->kind == EditorDocumentKind::Text && !document->read_only
+                             document->kind == EditorDocumentKind::Text && !document->read_only &&
+                                     !document->closing
                                  ? FALSE
                                  : TRUE,
                              0);
@@ -1608,7 +1703,7 @@ struct EditorPage::Impl {
     void RequestSave() {
         auto* document = ActiveDocument();
         if (!document || document->kind != EditorDocumentKind::Text || document->read_only ||
-            document->saving) {
+            document->saving || document->closing) {
             return;
         }
         InvokeSafely(save_requested, BuildSaveRequest(*document));
@@ -1624,7 +1719,7 @@ struct EditorPage::Impl {
 
     void RequestCloseDocument(EditorDocumentId id) {
         auto* document = FindDocument(id);
-        if (!document) {
+        if (!document || document->closing) {
             return;
         }
         if (close_requested) {
@@ -1726,6 +1821,8 @@ struct EditorPage::Impl {
         }
         if (header.hwndFrom == editor && header.code == kScnUpdateUi) {
             UpdateEditorScrollbarWindows();
+            if (!loading_document)
+                UpdateStatus();
             return false;
         }
         if (header.hwndFrom == editor && active_id) {
@@ -1757,10 +1854,6 @@ struct EditorPage::Impl {
                 return false;
             }
             if (header.code == kScnSavePointReached && !document->saving) {
-                UpdateStatus();
-                return false;
-            }
-            if (header.code == kScnUpdateUi) {
                 UpdateStatus();
                 return false;
             }
@@ -1861,7 +1954,7 @@ struct EditorPage::Impl {
         GetClientRect(hwnd, &client);
         const UINT dpi = detail::WindowDpi(hwnd);
         const int thickness = std::max(1, detail::ScaleForDpi(2, dpi));
-        const int gap = detail::ScaleForDpi(8, dpi);
+        const int gap = detail::ScaleForDpi(6, dpi);
         int x{};
         int y{};
         int width{};
@@ -1901,7 +1994,7 @@ struct EditorPage::Impl {
             const int maximum = std::max(minimum, available / 2);
             const int next_value = std::clamp(
                 resize_start + static_cast<int>(point.x - resize_origin.x), minimum, maximum);
-            const int gap = detail::ScaleForDpi(8, dpi);
+            const int gap = detail::ScaleForDpi(6, dpi);
             const int next_position = next_value + gap / 2;
             if (next_position != resize_preview_position) {
                 resize_preview_value = next_value;
@@ -1913,9 +2006,8 @@ struct EditorPage::Impl {
                 resize_start - static_cast<int>(point.y - resize_origin.y),
                 detail::ScaleForDpi(60, dpi),
                 std::max(detail::ScaleForDpi(60, dpi), static_cast<int>(client.bottom / 2)));
-            const int pad = detail::ScaleForDpi(12, dpi);
-            const int gap = detail::ScaleForDpi(8, dpi);
-            const int next_position = static_cast<int>(client.bottom) - pad - next_value - gap / 2;
+            const int next_position =
+                static_cast<int>(client.bottom) - next_value - detail::ScaleForDpi(11, dpi);
             if (next_position != resize_preview_position) {
                 resize_preview_value = next_value;
                 resize_preview_position = next_position;
@@ -1960,7 +2052,87 @@ struct EditorPage::Impl {
         return false;
     }
 
+    struct PageMetrics {
+        int pad{}, gap{}, row{}, button{}, left_width{}, right_x{}, right_width{};
+        int header_height{}, path_height{}, path_top{}, editor_y{}, editor_height{};
+        int status_y{}, status_height{}, conflict_height{}, conflict_y{};
+        RECT save{}, owner{}, details{}, encoding{};
+    };
+
+    PageMetrics Measure(const int width, const int height) {
+        const auto dpi = detail::WindowDpi(hwnd);
+        const auto px = [dpi](int value) {
+            return detail::ScaleForDpi(value, dpi);
+        };
+        PageMetrics m;
+        m.pad = px(10);
+        m.gap = px(6);
+        m.row = px(26);
+        m.button = px(64);
+        const int min_left = std::min(px(theme::kServerSidebarWidth), std::max(0, width / 2));
+        const int max_left = std::max(min_left, width / 2);
+        m.left_width =
+            std::clamp(left_width_override > 0 ? left_width_override : px(232), min_left, max_left);
+        left_width_override = m.left_width;
+        m.right_x = m.left_width + m.gap;
+        m.right_width = std::max(0, width - m.right_x - px(8));
+        m.header_height = px(34);
+        m.path_height = px(28);
+        m.path_top = px(3);
+        m.editor_y = std::min(height, m.header_height);
+        if (conflict_visible && conflict_height_override == 0)
+            conflict_height_override = px(84);
+        m.conflict_height =
+            conflict_visible
+                ? std::clamp(conflict_height_override > 0 ? conflict_height_override : px(84),
+                             px(60),
+                             std::max(px(60), height / 2))
+                : 0;
+        m.status_height = std::min(m.row, std::max(0, height - m.editor_y));
+        m.status_y = std::max(m.editor_y,
+                              height - m.status_height - m.conflict_height -
+                                  (conflict_visible ? px(14) : 0));
+        m.editor_height = std::max(0, m.status_y - m.editor_y);
+        m.conflict_y = m.status_y + m.status_height + px(6);
+        const int right = m.right_x + m.right_width;
+        m.save = {std::max(m.right_x, right - m.button), px(3), right, px(31)};
+        const auto* document = ActiveDocument();
+        const bool editable =
+            document && document->kind == EditorDocumentKind::Text && !document->read_only;
+        const int encoding_width = editable ? std::min(px(88), m.right_width) : 0;
+        m.encoding = {right - encoding_width,
+                      m.status_y + px(2),
+                      right,
+                      m.status_y + m.status_height - px(2)};
+        const int metadata_width =
+            m.right_width >= px(620)
+                ? px(240)
+                : (m.right_width >= px(440) ? px(170) : (m.right_width >= px(320) ? px(100) : 0));
+        const int metadata_right = right - encoding_width - (encoding_width ? px(8) : 0);
+        m.details = {std::max(m.right_x, metadata_right - metadata_width),
+                     m.status_y,
+                     metadata_right,
+                     m.status_y + m.status_height};
+        m.owner = {m.right_x + std::min(px(8), m.right_width),
+                   m.status_y,
+                   std::max<LONG>(m.right_x, m.details.left - px(8)),
+                   m.status_y + m.status_height};
+        if (m.owner.right < m.owner.left)
+            m.owner.right = m.owner.left;
+        return m;
+    }
+
     void HandleSurfaceClick(int id) {
+        if (id == kTabPreviousId || id == kTabNextId) {
+            if (id == kTabPreviousId && first_tab > 0)
+                --first_tab;
+            if (id == kTabNextId && first_tab + visible_tabs < documents.size())
+                ++first_tab;
+            InvalidateTabStrip();
+            if (ActiveDocument() && editor && IsWindowVisible(editor))
+                SetFocus(editor);
+            return;
+        }
         if (id >= kDocumentCloseFirstId &&
             id < kDocumentCloseFirstId + static_cast<int>(documents.size())) {
             RequestCloseDocument(
@@ -1982,21 +2154,11 @@ struct EditorPage::Impl {
         }
         const UINT dpi = detail::WindowDpi(hwnd);
         const float scale = static_cast<float>(dpi) / 96.0F;
-        const int pad = detail::ScaleForDpi(12, dpi);
-        const int gap = detail::ScaleForDpi(8, dpi);
-        const int row = detail::ScaleForDpi(32, dpi);
-        const int button = detail::ScaleForDpi(68, dpi);
-        const int available_width = std::max(0, width);
-        const int min_left =
-            (std::min)(detail::ScaleForDpi(theme::kServerSidebarWidth, dpi), available_width / 2);
-        const int max_left = (std::max)(min_left, available_width / 2);
-        if (left_width_override == 0) {
-            left_width_override = min_left;
-        }
-        const int left_width = std::clamp(left_width_override, min_left, max_left);
+        const auto m = Measure(width, height);
+        const int pad = m.pad, gap = m.gap, row = m.row;
+        const int left_width = m.left_width;
         const int file_left = 0;
-        const int right_x = file_left + left_width + gap;
-        const int right_width = (std::max)(0, width - right_x - pad);
+        const int right_x = m.right_x, right_width = m.right_width;
 
         surface.Add({
             .role = detail::UiRole::panel,
@@ -2012,22 +2174,15 @@ struct EditorPage::Impl {
                                      static_cast<float>(file_left + left_width + 1),
                                      static_cast<float>(height)),
         });
-        surface.Add({
-            .role = detail::UiRole::separator,
-            .bounds = detail::UiRect(static_cast<float>(file_left + left_width + gap / 2),
-                                     0.0F,
-                                     static_cast<float>(file_left + left_width + gap / 2 + 2),
-                                     static_cast<float>(height)),
-        });
         const float refresh_width = static_cast<float>(detail::ScaleForDpi(26, dpi));
         surface.Add({
             .id = kPathRefreshId,
             .role = detail::UiRole::icon_button,
             .bounds =
                 detail::UiRect(static_cast<float>(file_left + left_width - pad) - refresh_width,
-                               static_cast<float>(pad),
+                               static_cast<float>(m.path_top),
                                static_cast<float>(file_left + left_width - pad),
-                               static_cast<float>(pad + detail::ScaleForDpi(24, dpi))),
+                               static_cast<float>(m.path_top + m.path_height)),
             .icon = detail::UiIcon::refresh,
             .alignment = detail::UiTextAlign::center,
             .enabled = !selected_server_id.empty(),
@@ -2036,13 +2191,31 @@ struct EditorPage::Impl {
         // the active document surface joins it without an extra gap.
         const int tab_y = 0;
         const float strip_height = 34.0F * scale;
-        const int close_x = right_x + right_width;
-        const float tab_available = static_cast<float>(std::max(0, right_width)) - 10.0F * scale;
-        const float tab_width =
-            documents.empty() ? 0.0F
-                              : std::clamp(tab_available / static_cast<float>(documents.size()),
-                                           78.0F * scale,
-                                           147.0F * scale);
+        const int tab_room =
+            std::max(1, static_cast<int>(m.save.left) - right_x - detail::ScaleForDpi(12, dpi));
+        const int arrow = std::min(detail::ScaleForDpi(20, dpi), tab_room / 4);
+        auto viewport = ComputeTerminalTabViewport(
+            tab_room,
+            detail::ScaleForDpi(90, dpi),
+            detail::ScaleForDpi(170, dpi),
+            detail::ScaleForDpi(2, dpi),
+            arrow * 2,
+            m.save.left - right_x > detail::ScaleForDpi(18, dpi) ? documents.size() : 0,
+            first_tab);
+        if (previous_tab_active != active_id || previous_tab_count != documents.size() ||
+            previous_tab_room != tab_room) {
+            if (const auto found =
+                    std::ranges::find(documents, active_id.value_or(0), &DocumentState::id);
+                found != documents.end())
+                viewport.Reveal(static_cast<std::size_t>(std::distance(documents.begin(), found)),
+                                documents.size());
+        }
+        first_tab = viewport.first;
+        visible_tabs = viewport.count;
+        previous_tab_active = active_id;
+        previous_tab_count = documents.size();
+        previous_tab_room = tab_room;
+        const float tab_width = static_cast<float>(viewport.tab_width);
         surface.Add({
             .role = detail::UiRole::panel,
             .bounds = detail::UiRect(static_cast<float>(right_x),
@@ -2051,18 +2224,15 @@ struct EditorPage::Impl {
                                      static_cast<float>(tab_y) + strip_height),
         });
         float tab_x = static_cast<float>(right_x) + 5.0F * scale;
-        for (std::size_t index = 0; index < documents.size(); ++index) {
-            if (tab_x >= close_x) {
-                break;
-            }
+        for (std::size_t index = viewport.first; index < viewport.first + viewport.count; ++index) {
             const auto& document = documents[index];
             std::wstring label = document.title.empty() ? L"未命名" : document.title;
             if (document.saving) {
-                label.append(L"  保存中…");
+                label.insert(0, L"◌  ");
             } else if (document.dirty) {
-                label.append(L"  ●");
+                label.insert(0, L"●  ");
             }
-            const float right = std::min(tab_x + tab_width, static_cast<float>(close_x));
+            const float right = tab_x + tab_width;
             surface.Add({
                 .id = kDocumentTabFirstId + static_cast<int>(index),
                 .role = detail::UiRole::file_tab,
@@ -2071,12 +2241,16 @@ struct EditorPage::Impl {
                                          right,
                                          static_cast<float>(tab_y) + strip_height - 1.0F * scale),
                 .text = std::move(label),
-                .icon = detail::UiIcon::edit,
                 .alignment = detail::UiTextAlign::leading,
                 .selected = active_id && *active_id == document.id,
                 .compact_text = true,
+                .text_right_inset = 20.0F * scale,
             });
             const float close_width = 18.0F * scale;
+            const bool show_close =
+                (active_id && *active_id == document.id) ||
+                surface.hovered_id() == kDocumentTabFirstId + static_cast<int>(index) ||
+                surface.hovered_id() == kDocumentCloseFirstId + static_cast<int>(index);
             surface.Add({
                 .id = kDocumentCloseFirstId + static_cast<int>(index),
                 .role = detail::UiRole::tab_close,
@@ -2087,54 +2261,71 @@ struct EditorPage::Impl {
                                    static_cast<float>(tab_y) + (strip_height + close_width) / 2.0F),
                 .icon = detail::UiIcon::close,
                 .alignment = detail::UiTextAlign::center,
+                .visible = show_close,
             });
             tab_x = right + 2.0F * scale;
         }
-
-        const int status_height = row;
-        const int conflict_height =
-            conflict_visible ? (conflict_height_override > 0 ? conflict_height_override
-                                                             : detail::ScaleForDpi(74, dpi))
-                             : 0;
-        const int status_base_y =
-            height - pad - status_height - conflict_height - (conflict_visible ? gap : 0);
-        const int editor_frame_y = detail::ScaleForDpi(34, dpi) - 1;
-        if (right_width > 0 && status_base_y > editor_frame_y) {
-            // Use the application theme border instead of the bright native
-            // WS_EX_CLIENTEDGE frame. The native editor is inset in Layout().
-            const float border = static_cast<float>(std::max(1, detail::ScaleForDpi(1, dpi)));
-            const float left = static_cast<float>(right_x);
-            const float top = static_cast<float>(editor_frame_y);
-            const float right = static_cast<float>(right_x + right_width);
-            const float bottom = static_cast<float>(status_base_y);
-            surface.Add({.role = detail::UiRole::separator,
-                         .bounds = detail::UiRect(left, top, right, top + border)});
-            surface.Add({.role = detail::UiRole::separator,
-                         .bounds = detail::UiRect(left, bottom - border, right, bottom)});
-            surface.Add({.role = detail::UiRole::separator,
-                         .bounds = detail::UiRect(left, top, left + border, bottom)});
-            surface.Add({.role = detail::UiRole::separator,
-                         .bounds = detail::UiRect(right - border, top, right, bottom)});
+        if (viewport.overflow) {
+            const float start = static_cast<float>(right_x + tab_room - arrow * 2) + 5.0F * scale;
+            surface.Add(
+                {.id = kTabPreviousId,
+                 .role = detail::UiRole::tab_close,
+                 .bounds = detail::UiRect(start, 5.0F * scale, start + arrow, 29.0F * scale),
+                 .icon = detail::UiIcon::chevron_left,
+                 .alignment = detail::UiTextAlign::center,
+                 .enabled = viewport.first > 0});
+            surface.Add({.id = kTabNextId,
+                         .role = detail::UiRole::tab_close,
+                         .bounds = detail::UiRect(
+                             start + arrow, 5.0F * scale, start + arrow * 2, 29.0F * scale),
+                         .icon = detail::UiIcon::chevron,
+                         .alignment = detail::UiTextAlign::center,
+                         .enabled = viewport.first + viewport.count < documents.size()});
         }
-        const int status_y = status_base_y + (conflict_visible ? 0 : pad / 2);
+
+        const int status_height = m.status_height;
+        surface.Add({.role = detail::UiRole::separator,
+                     .bounds = detail::UiRect(static_cast<float>(right_x),
+                                              static_cast<float>(m.status_y),
+                                              static_cast<float>(right_x + right_width),
+                                              static_cast<float>(m.status_y + 1))});
+        const auto* current = ActiveDocument();
         surface.Add({
             .id = kSaveId,
-            .role = detail::UiRole::primary_button,
-            .bounds = detail::UiRect(static_cast<float>(right_x + right_width - button),
-                                     static_cast<float>(status_y),
-                                     static_cast<float>(right_x + right_width),
-                                     static_cast<float>(status_y + status_height)),
-            .text = L"保存",
+            .role = current && current->dirty ? detail::UiRole::primary_button
+                                              : detail::UiRole::ghost_button,
+            .bounds = detail::UiRect(static_cast<float>(m.save.left),
+                                     static_cast<float>(m.save.top),
+                                     static_cast<float>(m.save.right),
+                                     static_cast<float>(m.save.bottom)),
+            .text = current && current->saving ? L"保存中" : L"保存",
             .alignment = detail::UiTextAlign::center,
             .enabled = ActiveDocument() && ActiveDocument()->kind == EditorDocumentKind::Text &&
-                       !ActiveDocument()->read_only && !ActiveDocument()->saving,
+                       !ActiveDocument()->read_only && !ActiveDocument()->saving &&
+                       !ActiveDocument()->closing,
         });
+        if (!current) {
+            const float middle = static_cast<float>(m.editor_y + m.editor_height / 2);
+            surface.Add({.role = detail::UiRole::heading,
+                         .bounds = detail::UiRect(static_cast<float>(right_x),
+                                                  middle - 42.0F * scale,
+                                                  static_cast<float>(right_x + right_width),
+                                                  middle),
+                         .text = scintilla_available ? L"打开文件，开始编辑" : L"编辑器组件未加载",
+                         .alignment = detail::UiTextAlign::center});
+            surface.Add({.role = detail::UiRole::muted,
+                         .bounds = detail::UiRect(static_cast<float>(right_x),
+                                                  middle + 5.0F * scale,
+                                                  static_cast<float>(right_x + right_width),
+                                                  middle + 38.0F * scale),
+                         .text = scintilla_available ? L"双击左侧文件打开 · Ctrl+S 保存"
+                                                     : L"请检查 Scintilla.dll 和 Lexilla.dll",
+                         .alignment = detail::UiTextAlign::center});
+        }
 
         if (conflict_visible) {
-            const int visible_conflict_height = conflict_height_override > 0
-                                                    ? conflict_height_override
-                                                    : detail::ScaleForDpi(74, dpi);
-            const int conflict_y = height - pad - visible_conflict_height;
+            const int visible_conflict_height = m.conflict_height;
+            const int conflict_y = m.conflict_y;
             if (conflict_splitter_y > 0) {
                 surface.Add({
                     .role = detail::UiRole::separator,
@@ -2152,18 +2343,27 @@ struct EditorPage::Impl {
                                          static_cast<float>(conflict_y + visible_conflict_height)),
             });
             const auto* document = ActiveDocument();
+            const bool stacked = right_width < detail::ScaleForDpi(640, dpi);
+            const int close_width = detail::ScaleForDpi(26, dpi);
+            const int action_width =
+                stacked ? std::max(1, (right_width - close_width - pad * 2 - gap * 3) / 3)
+                        : detail::ScaleForDpi(82, dpi);
+            const int action_y = stacked ? conflict_y + visible_conflict_height - row - gap
+                                         : conflict_y + (visible_conflict_height - row) / 2;
             surface.Add({
                 .role = detail::UiRole::status,
                 .bounds = detail::UiRect(
                     static_cast<float>(right_x + pad),
                     static_cast<float>(conflict_y),
-                    static_cast<float>(right_x + right_width - detail::ScaleForDpi(350, dpi)),
-                    static_cast<float>(conflict_y + visible_conflict_height)),
+                    static_cast<float>(stacked
+                                           ? right_x + right_width - pad
+                                           : right_x + right_width - detail::ScaleForDpi(350, dpi)),
+                    static_cast<float>(stacked ? action_y : conflict_y + visible_conflict_height)),
                 .text = document ? document->conflict : L"远程文件发生变化",
             });
-            const int action_width = detail::ScaleForDpi(82, dpi);
-            const int close_width = detail::ScaleForDpi(30, dpi);
-            int action_x = right_x + right_width - (action_width * 3 + close_width + pad * 4);
+            int action_x = stacked ? right_x + pad
+                                   : right_x + right_width -
+                                         (action_width * 3 + close_width + gap * 3 + pad * 2);
             static constexpr std::array<int, 3> conflict_ids = {kDiffId, kOverwriteId, kSaveAsId};
             static constexpr std::array<const wchar_t*, 3> conflict_labels = {
                 L"查看差异", L"覆盖远端", L"另存为"};
@@ -2171,24 +2371,23 @@ struct EditorPage::Impl {
                 surface.Add({
                     .id = conflict_ids[index],
                     .role = detail::UiRole::ghost_button,
-                    .bounds = detail::UiRect(
-                        static_cast<float>(action_x),
-                        static_cast<float>(conflict_y + (visible_conflict_height - row) / 2),
-                        static_cast<float>(action_x + action_width),
-                        static_cast<float>(conflict_y + (visible_conflict_height + row) / 2)),
+                    .bounds = detail::UiRect(static_cast<float>(action_x),
+                                             static_cast<float>(action_y),
+                                             static_cast<float>(action_x + action_width),
+                                             static_cast<float>(action_y + row)),
                     .text = conflict_labels[index],
                     .alignment = detail::UiTextAlign::center,
                 });
-                action_x += action_width + pad;
+                action_x += action_width + gap;
             }
             surface.Add({
                 .id = kDismissConflictId,
                 .role = detail::UiRole::icon_button,
-                .bounds = detail::UiRect(
-                    static_cast<float>(right_x + right_width - close_width - pad),
-                    static_cast<float>(conflict_y + (visible_conflict_height - row) / 2),
-                    static_cast<float>(right_x + right_width - pad),
-                    static_cast<float>(conflict_y + (visible_conflict_height + row) / 2)),
+                .bounds =
+                    detail::UiRect(static_cast<float>(right_x + right_width - close_width - pad),
+                                   static_cast<float>(action_y),
+                                   static_cast<float>(right_x + right_width - pad),
+                                   static_cast<float>(action_y + row)),
                 .icon = detail::UiIcon::close,
                 .alignment = detail::UiTextAlign::center,
             });
@@ -2201,7 +2400,7 @@ struct EditorPage::Impl {
         RECT client{};
         GetClientRect(hwnd, &client);
         const UINT dpi = detail::WindowDpi(hwnd);
-        const int right_x = left_splitter_x + detail::ScaleForDpi(8, dpi);
+        const int right_x = left_splitter_x + detail::ScaleForDpi(3, dpi);
         const RECT strip{right_x, 0, client.right, detail::ScaleForDpi(35, dpi)};
         InvalidateRect(hwnd, &strip, FALSE);
     }
@@ -2216,8 +2415,8 @@ struct EditorPage::Impl {
             surface.SetOverlayAccent(std::nullopt);
             return;
         }
-        const int tab_id = kDocumentTabFirstId +
-                           static_cast<int>(std::distance(documents.begin(), found));
+        const int tab_id =
+            kDocumentTabFirstId + static_cast<int>(std::distance(documents.begin(), found));
         for (const auto& element : surface.elements()) {
             if (element.id != tab_id || element.role != detail::UiRole::file_tab) {
                 continue;
@@ -2253,9 +2452,9 @@ struct EditorPage::Impl {
             KillTimer(hwnd, kTabMotionTimerId);
             return;
         }
-        const float fraction = std::min(1.0F, static_cast<float>(GetTickCount64() -
-                                                                tab_motion_start) /
-                                                      static_cast<float>(kTabMotionDurationMs));
+        const float fraction = std::min(1.0F,
+                                        static_cast<float>(GetTickCount64() - tab_motion_start) /
+                                            static_cast<float>(kTabMotionDurationMs));
         tab_motion_progress = 1.0F - (1.0F - fraction) * (1.0F - fraction);
         tab_motion_active = fraction < 1.0F;
         if (!tab_motion_active) {
@@ -2270,32 +2469,21 @@ struct EditorPage::Impl {
             return;
         }
         const UINT dpi = detail::WindowDpi(hwnd);
-        const int pad = detail::ScaleForDpi(12, dpi);
-        const int gap = detail::ScaleForDpi(8, dpi);
-        const int row = detail::ScaleForDpi(32, dpi);
-        const int button = detail::ScaleForDpi(68, dpi);
+        const auto m = Measure(width, height);
+        const int pad = m.pad, gap = m.gap;
         // 服务器侧栏由 MainWindow 统一创建和布局。EditorPage 收到的客户区已经是
         // 扣除共享侧栏后的页面区域，这里不能再次预留侧栏宽度，否则切换侧栏可见性时
         // 文件列表会被移出客户区，看起来像是“消失”了。
-        const int available_width = std::max(0, width);
-        const int min_left =
-            (std::min)(detail::ScaleForDpi(theme::kServerSidebarWidth, dpi), available_width / 2);
-        const int max_left = (std::max)(min_left, available_width / 2);
-        if (left_width_override == 0) {
-            left_width_override = min_left;
-        }
-        const int left_width = std::clamp(left_width_override, min_left, max_left);
-        left_width_override = left_width;
+        const int left_width = m.left_width;
         const int file_left = 0;
-        const int right_x = file_left + left_width + gap;
-        const int right_width = (std::max)(0, width - right_x - pad);
+        const int right_x = m.right_x, right_width = m.right_width;
         left_splitter_x = file_left + left_width + gap / 2;
 
-        const int path_height = detail::ScaleForDpi(24, dpi);
+        const int path_height = m.path_height;
         const int file_x = file_left + pad;
         const int file_width = std::max(1, left_width - pad * 2);
         const int path_width = std::max(1, file_width - detail::ScaleForDpi(32, dpi));
-        const int path_top = pad;
+        const int path_top = m.path_top;
         MoveWindow(path_frame, file_x, path_top, path_width, path_height, TRUE);
         if (path_frame_region.cx != path_width || path_frame_region.cy != path_height) {
             detail::SetRoundedControlRegion(
@@ -2323,57 +2511,23 @@ struct EditorPage::Impl {
             file_column_width = file_width;
         }
 
-        const int tab_y = 0;
-        const int tab_height = detail::ScaleForDpi(34, dpi);
-
-        const int editor_y = tab_y + tab_height - 1;
-        const int status_height = row;
-        if (conflict_height_override == 0) {
-            conflict_height_override = detail::ScaleForDpi(74, dpi);
-        }
-        const int conflict_height =
-            conflict_visible ? std::clamp(conflict_height_override,
-                                          detail::ScaleForDpi(60, dpi),
-                                          std::max(detail::ScaleForDpi(60, dpi), height / 2))
-                             : 0;
-        const int editor_height = (std::max)(0,
-                                             height - editor_y - pad - status_height -
-                                                 conflict_height - (conflict_visible ? gap : 0));
-        const int editor_border = std::max(1, detail::ScaleForDpi(1, dpi));
-        const int editor_content_width = std::max(0, right_width - editor_border * 2);
-        const int editor_content_height = std::max(0, editor_height - editor_border * 2);
-        MoveWindow(editor,
-                   right_x + editor_border,
-                   editor_y + editor_border,
-                   editor_content_width,
-                   editor_content_height,
-                   TRUE);
+        MoveWindow(editor, right_x, m.editor_y, right_width, m.editor_height, TRUE);
         UpdateHorizontalScrollbar();
-        MoveWindow(preview,
-                   right_x + editor_border,
-                   editor_y + editor_border,
-                   editor_content_width,
-                   editor_content_height,
-                   TRUE);
-        const int status_base_y = editor_y + editor_height;
-        const int status_y = status_base_y + (conflict_visible ? 0 : pad / 2);
-        MoveWindow(status_bar,
-                   right_x,
-                   status_y,
-                   std::max(0, right_width - button - gap - detail::ScaleForDpi(110, dpi)),
-                   status_height,
-                   TRUE);
-        MoveWindow(encoding_selector,
-                   right_x +
-                       std::max(0, right_width - button - gap - detail::ScaleForDpi(104, dpi)),
-                   status_y + detail::ScaleForDpi(3, dpi),
-                   detail::ScaleForDpi(96, dpi),
-                   std::max(1, status_height - detail::ScaleForDpi(6, dpi)),
-                   TRUE);
+        MoveWindow(preview, right_x, m.editor_y, right_width, m.editor_height, TRUE);
+        const auto place = [](HWND control, RECT bounds) {
+            MoveWindow(control,
+                       bounds.left,
+                       bounds.top,
+                       std::max(0L, bounds.right - bounds.left),
+                       std::max(0L, bounds.bottom - bounds.top),
+                       TRUE);
+        };
+        place(status_bar, m.owner);
+        place(status_details, m.details);
+        place(encoding_selector, m.encoding);
 
         if (conflict_visible) {
-            const int conflict_y = status_base_y + status_height + gap;
-            conflict_splitter_y = conflict_y - gap / 2;
+            conflict_splitter_y = m.conflict_y - gap / 2;
         } else {
             conflict_splitter_y = 0;
         }
@@ -2383,6 +2537,8 @@ struct EditorPage::Impl {
 EditorPage::EditorPage() : impl_(std::make_unique<Impl>()) {}
 
 EditorPage::~EditorPage() {
+    if (impl_->tooltip && IsWindow(impl_->tooltip))
+        DestroyWindow(impl_->tooltip);
     if (impl_->resize_guide && IsWindow(impl_->resize_guide)) {
         DestroyWindow(impl_->resize_guide);
     }
@@ -2398,6 +2554,7 @@ EditorPage::~EditorPage() {
     DeleteObject(impl_->font);
     DeleteObject(impl_->title_font);
     DeleteObject(impl_->mono_font);
+    DeleteObject(impl_->caption_font);
 }
 
 bool EditorPage::Create(HWND parent, HINSTANCE instance) {
@@ -2444,6 +2601,7 @@ bool EditorPage::Create(HWND parent, HINSTANCE instance) {
 
     const UINT dpi = detail::WindowDpi(parent);
     impl_->font = detail::CreateUiFont(dpi, 10);
+    impl_->caption_font = detail::CreateUiFont(dpi, 9);
     impl_->title_font = detail::CreateUiFont(dpi, 11, true);
     impl_->mono_font = CreateFontW(-MulDiv(10, static_cast<int>(dpi), 72),
                                    0,
@@ -2494,8 +2652,7 @@ bool EditorPage::Create(HWND parent, HINSTANCE instance) {
     impl_->folder_icon = system_file_icons.folder;
     impl_->file_icon = system_file_icons.file;
     table::SetImageList(impl_->file_list, system_file_icons.image_list);
-    const std::array file_columns{
-        table::Column{L"名称", detail::ScaleForDpi(220, dpi), 1}};
+    const std::array file_columns{table::Column{L"名称", detail::ScaleForDpi(220, dpi), 1}};
     table::SetColumns(impl_->file_list, file_columns);
     table::SetFillLastColumn(impl_->file_list, true);
     table::SetTextProvider(impl_->file_list,
@@ -2559,19 +2716,32 @@ bool EditorPage::Create(HWND parent, HINSTANCE instance) {
                                      nullptr,
                                      instance,
                                      nullptr);
-    impl_->status_bar = CreateWindowExW(0,
-                                        L"STATIC",
-                                        L"未打开文件",
-                                        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE |
-                                            SS_ENDELLIPSIS,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        impl_->hwnd,
-                                        nullptr,
-                                        instance,
-                                        nullptr);
+    impl_->status_bar =
+        CreateWindowExW(0,
+                        L"STATIC",
+                        L"未打开文件",
+                        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS,
+                        0,
+                        0,
+                        0,
+                        0,
+                        impl_->hwnd,
+                        nullptr,
+                        instance,
+                        nullptr);
+    impl_->status_details =
+        CreateWindowExW(0,
+                        L"STATIC",
+                        L"",
+                        WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE | SS_ENDELLIPSIS,
+                        0,
+                        0,
+                        0,
+                        0,
+                        impl_->hwnd,
+                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStatusDetailsId)),
+                        instance,
+                        nullptr);
     impl_->encoding_selector =
         CreateWindowExW(0,
                         selector::kClassName,
@@ -2591,6 +2761,7 @@ bool EditorPage::Create(HWND parent, HINSTANCE instance) {
     SendMessageW(impl_->encoding_selector, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"GB2312"));
     SendMessageW(impl_->encoding_selector, CB_SETCURSEL, 0, 0);
     SendMessageW(impl_->encoding_selector, CB_SETITEMHEIGHT, 0, detail::ScaleForDpi(22, dpi));
+    selector::SetTerminalOverlayStyle(impl_->encoding_selector, true);
 
     for (HWND control : {impl_->path_frame,
                          impl_->path_edit,
@@ -2598,18 +2769,45 @@ bool EditorPage::Create(HWND parent, HINSTANCE instance) {
                          impl_->editor,
                          impl_->preview,
                          impl_->status_bar,
+                         impl_->status_details,
                          impl_->encoding_selector}) {
         detail::ApplySelfDrawnTheme(control);
         detail::SetControlFont(control, impl_->font);
     }
     table::ApplyTheme(impl_->file_list);
-    detail::SetControlFont(impl_->path_edit, impl_->title_font);
+    detail::SetControlFont(impl_->path_edit, impl_->font);
+    detail::SetControlFont(impl_->status_bar, impl_->caption_font);
+    detail::SetControlFont(impl_->status_details, impl_->caption_font);
+    detail::SetControlFont(impl_->encoding_selector, impl_->caption_font);
     detail::SetControlFont(impl_->preview, impl_->mono_font);
     for (HWND control : {impl_->editor, impl_->preview, impl_->file_list, impl_->path_edit}) {
         impl_->Subclass(control);
     }
-    SetDirectoryState(
-        {ViewPhase::Idle, L"双击侧栏服务器以打开文件", ViewRecoveryAction::None});
+    impl_->tooltip = CreateWindowExW(WS_EX_TOPMOST,
+                                     TOOLTIPS_CLASSW,
+                                     nullptr,
+                                     WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                     CW_USEDEFAULT,
+                                     CW_USEDEFAULT,
+                                     CW_USEDEFAULT,
+                                     CW_USEDEFAULT,
+                                     impl_->hwnd,
+                                     nullptr,
+                                     instance,
+                                     nullptr);
+    if (impl_->tooltip) {
+        for (const auto control : {impl_->hwnd, impl_->status_bar, impl_->path_edit}) {
+            TOOLINFOW info{sizeof(info)};
+            info.uFlags = TTF_IDISHWND | TTF_SUBCLASS | TTF_TRANSPARENT;
+            info.hwnd = impl_->hwnd;
+            info.uId = reinterpret_cast<UINT_PTR>(control);
+            info.lpszText = LPSTR_TEXTCALLBACKW;
+            SendMessageW(impl_->tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
+        }
+        SendMessageW(impl_->tooltip, TTM_SETMAXTIPWIDTH, 0, detail::ScaleForDpi(520, dpi));
+    }
+    SetDirectoryState({ViewPhase::Idle, L"双击侧栏服务器以打开文件", ViewRecoveryAction::None});
+    impl_->LoadActiveDocument();
     return true;
 }
 
@@ -2884,6 +3082,10 @@ bool EditorPage::CloseDocument(EditorDocumentId id) {
     return impl_->CloseDocument(id);
 }
 
+void EditorPage::RequestCloseDocument(EditorDocumentId id) {
+    impl_->RequestCloseDocument(id);
+}
+
 bool EditorPage::SetDocumentContent(EditorDocumentId id,
                                     std::string content,
                                     EditorTextEncoding encoding,
@@ -2922,12 +3124,30 @@ void EditorPage::SetDocumentSaving(EditorDocumentId id, bool saving) {
     }
     document->saving = saving;
     if (impl_->active_id && *impl_->active_id == id && impl_->encoding_selector) {
-        EnableWindow(impl_->encoding_selector, !saving);
+        EnableWindow(impl_->encoding_selector,
+                     !saving && !document->closing && !document->read_only);
     }
     InvalidateRect(impl_->hwnd, nullptr, FALSE);
     if (impl_->active_id && *impl_->active_id == id) {
         impl_->UpdateStatus();
     }
+}
+
+void EditorPage::SetDocumentClosing(EditorDocumentId id, bool closing) {
+    auto* document = impl_->FindDocument(id);
+    if (!document)
+        return;
+    document->closing = closing;
+    if (impl_->active_id && *impl_->active_id == id) {
+        SendMessageW(impl_->editor,
+                     kSciSetReadOnly,
+                     closing || document->read_only || document->kind != EditorDocumentKind::Text,
+                     0);
+        EnableWindow(impl_->encoding_selector,
+                     !closing && !document->saving && !document->read_only);
+        impl_->UpdateStatus();
+    }
+    InvalidateRect(impl_->hwnd, nullptr, FALSE);
 }
 
 void EditorPage::MarkDocumentSaved(EditorDocumentId id) {
@@ -2953,6 +3173,26 @@ void EditorPage::MarkDocumentSaved(EditorDocumentId id) {
     InvalidateRect(impl_->hwnd, nullptr, FALSE);
     impl_->UpdateStatus();
     impl_->UpdateConflictBar();
+}
+
+void EditorPage::SetDocumentLocation(EditorDocumentId id,
+                                     std::wstring title,
+                                     std::string server_id,
+                                     std::wstring path) {
+    if (auto* document = impl_->FindDocument(id)) {
+        document->title = std::move(title);
+        impl_->BindDocumentServer(*document, std::move(server_id));
+        document->remote_path = std::move(path);
+        if (impl_->active_id == id && impl_->scintilla_available)
+            impl_->ConfigureLexer(*document);
+        impl_->UpdateStatus();
+        InvalidateRect(impl_->hwnd, nullptr, FALSE);
+    }
+}
+
+bool EditorPage::DocumentDirty(EditorDocumentId id) const noexcept {
+    const auto* document = impl_->FindDocument(id);
+    return document && document->dirty;
 }
 
 void EditorPage::SetDocumentConflict(EditorDocumentId id, std::wstring message) {
@@ -2993,6 +3233,14 @@ std::optional<std::string> EditorPage::DocumentText(EditorDocumentId id) {
 bool EditorPage::DocumentSaving(EditorDocumentId id) const noexcept {
     const auto* document = impl_->FindDocument(id);
     return document && document->saving;
+}
+
+std::optional<EditorSaveRequest> EditorPage::DocumentSnapshot(EditorDocumentId id) {
+    auto text = DocumentText(id);
+    const auto* document = impl_->FindDocument(id);
+    if (!document || !text)
+        return std::nullopt;
+    return EditorSaveRequest{id, std::move(*text), document->encoding, document->eol};
 }
 
 std::optional<EditorDocumentId> EditorPage::active_document() const noexcept {

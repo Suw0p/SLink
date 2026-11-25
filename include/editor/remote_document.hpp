@@ -15,6 +15,8 @@
 
 namespace SLink::editor {
 
+struct DocumentCacheRegistry;
+
 enum class EditorErrc {
     Ok = 0,
     InvalidArgument,
@@ -191,6 +193,9 @@ private:
 class RemoteEditorService {
 public:
     static constexpr std::uint64_t kEditableSizeLimit = 20ULL * 1024ULL * 1024ULL;
+    // GB2312 的双字节中文转为 UTF-8 后会膨胀；恢复缓存不能套用远端文件大小上限。
+    // 额外余量也用于保留暂时无法按当前编码保存的 Unicode 编辑内容。
+    static constexpr std::uint64_t kInternalTextSizeLimit = 2 * kEditableSizeLimit;
     static constexpr std::size_t kBinaryProbeBytes = 64ULL * 1024ULL;
 
     explicit RemoteEditorService(const storage::AppPaths& paths);
@@ -204,6 +209,7 @@ public:
 
 private:
     std::filesystem::path cache_dir_;
+    std::shared_ptr<DocumentCacheRegistry> cache_registry_;
 };
 
 } // namespace SLink::editor
