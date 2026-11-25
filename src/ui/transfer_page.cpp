@@ -439,6 +439,7 @@ struct TransferPage::Impl {
 
     struct TabInsertionTarget {
         std::size_t slot{};
+        unsigned group{};
         float x{};
         float top{};
         float bottom{};
@@ -558,6 +559,8 @@ struct TransferPage::Impl {
     bool tab_dragging{};
     int dragged_tab{-1};
     POINT tab_drag_origin{};
+    detail::TabDragVisual tab_drag_visual;
+    std::array<int, 6> drag_surface_geometry{};
     SplitDropZone visible_drop_zone{SplitDropZone::none};
     std::optional<std::size_t> visible_drop_pane;
     std::optional<TabInsertionTarget> visible_tab_insertion;
@@ -704,6 +707,9 @@ struct TransferPage::Impl {
                 return 0;
             }
             self->HandlePointerUp({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
+            return 0;
+        case WM_CANCELMODE:
+            self->CancelTabDrag();
             return 0;
         case WM_CAPTURECHANGED:
             if (self->resize_mode != ResizeMode::none) {
@@ -1230,7 +1236,11 @@ struct TransferPage::Impl {
                 continue;
             }
             RECT strip = pane_rects[index];
-            strip.bottom = std::min(strip.bottom, strip.top + tab_height);
+            strip.top =
+                std::max<LONG>(0, strip.top - detail::ScaleForDpi(8, detail::WindowDpi(hwnd)));
+            strip.bottom = std::min(strip.bottom,
+                                    pane_rects[index].top + tab_height +
+                                        detail::ScaleForDpi(12, detail::WindowDpi(hwnd)));
             if (PtInRect(&strip, point)) {
                 return index;
             }
@@ -1243,8 +1253,9 @@ struct TransferPage::Impl {
         if (left.has_value() != right.has_value()) {
             return false;
         }
-        return !left || (left->slot == right->slot && left->x == right->x &&
-                         left->top == right->top && left->bottom == right->bottom);
+        return !left ||
+               (left->slot == right->slot && left->group == right->group && left->x == right->x &&
+                left->top == right->top && left->bottom == right->bottom);
     }
 
     static std::size_t DestinationForSlot(const std::size_t source,
@@ -1255,7 +1266,7 @@ struct TransferPage::Impl {
     std::optional<TabInsertionTarget> TabInsertionAt(const POINT point,
                                                      const std::size_t source) const {
         const auto strip = TabStripAt(point);
-        if (!strip || source >= panes.size() || GroupOf(*strip) != GroupOf(source)) {
+        if (!strip || source >= panes.size()) {
             return std::nullopt;
         }
 
@@ -1266,7 +1277,7 @@ struct TransferPage::Impl {
                 continue;
             }
             const std::size_t index = static_cast<std::size_t>(element.id - kPaneTabBaseId);
-            if (GroupOf(index) == GroupOf(source)) {
+            if (GroupOf(index) == GroupOf(*strip)) {
                 tabs.push_back(&element);
             }
         }
@@ -1278,6 +1289,7 @@ struct TransferPage::Impl {
         });
 
         TabInsertionTarget target{};
+        target.group = GroupOf(*strip);
         const detail::UiElement* edge = tabs.back();
         target.slot = static_cast<std::size_t>(edge->id - kPaneTabBaseId) + 1;
         target.x = edge->bounds.right;
@@ -1293,50 +1305,59 @@ struct TransferPage::Impl {
                 break;
             }
         }
-        if (DestinationForSlot(source, target.slot) == source) {
+        if (target.group == GroupOf(source) && DestinationForSlot(source, target.slot) == source) {
             return std::nullopt;
         }
         return target;
     }
 
     SplitDropZone DropZoneAt(const POINT point, const int source_tab = -1) const noexcept {
-        const int effective_source = source_tab >= 0 ? source_tab : dragged_tab;
-        if (const auto target = TabStripAt(point)) {
-            if (split_active && effective_source >= 0 &&
-                GroupOf(*target) != GroupOf(static_cast<std::size_t>(effective_source))) {
-                return SplitDropZone::center;
-            }
-            return SplitDropZone::none;
-        }
+        const int source = source_tab >= 0 ? source_tab : dragged_tab;
+        if (const auto strip = TabStripAt(point))
+            return split_active && source >= 0 &&
+                           GroupOf(*strip) != GroupOf(static_cast<std::size_t>(source))
+                       ? SplitDropZone::center
+                       : SplitDropZone::none;
         const auto target = PaneAt(point);
-        if (!target) {
+        if (!target)
             return SplitDropZone::none;
-        }
-        const RECT& rect = pane_rects[*target];
-        return point.x - rect.left <= rect.right - point.x ? SplitDropZone::left
-                                                           : SplitDropZone::right;
+        if (split_active)
+            return source >= 0 && GroupOf(*target) != GroupOf(static_cast<std::size_t>(source))
+                       ? SplitDropZone::center
+                       : SplitDropZone::none;
+        const auto& rect = pane_rects[*target];
+        // 与终端保持一致：标签栏附近排序，内容区左右两侧用于分屏。
+        // 中央窄缝仍可取消，不要求用户拖到窗口外缘才能触发。
+        const LONG midpoint = rect.left + (rect.right - rect.left) / 2;
+        const int center_gap =
+            std::min(detail::ScaleForDpi(12, detail::WindowDpi(hwnd)),
+                     std::max(1, static_cast<int>((rect.right - rect.left) / 20)));
+        if (point.x < midpoint - center_gap)
+            return SplitDropZone::left;
+        if (point.x >= midpoint + center_gap)
+            return SplitDropZone::right;
+        return SplitDropZone::none;
     }
 
     RECT DropZoneRect() const noexcept {
-        RECT result = visible_drop_pane && *visible_drop_pane < pane_rects.size()
-                          ? pane_rects[*visible_drop_pane]
-                          : RECT{};
-        switch (visible_drop_zone) {
-        case SplitDropZone::left:
-            result.right = result.left + (result.right - result.left) / 2;
-            break;
-        case SplitDropZone::right:
-            result.left = result.left + (result.right - result.left) / 2;
-            break;
-        case SplitDropZone::center:
-            result.bottom = std::min(result.bottom,
-                                     result.top + detail::ScaleForDpi(40, detail::WindowDpi(hwnd)));
-            break;
-        case SplitDropZone::none:
-            result = {};
-            break;
-        }
-        return result;
+        if (!visible_drop_pane || *visible_drop_pane >= pane_rects.size())
+            return {};
+        RECT rect = pane_rects[*visible_drop_pane];
+        const UINT dpi = detail::WindowDpi(hwnd);
+        const int inset = detail::ScaleForDpi(5, dpi),
+                  line = std::max(1, detail::ScaleForDpi(2, dpi));
+        rect.bottom = std::min(rect.bottom, rect.top + detail::ScaleForDpi(34, dpi));
+        if (visible_drop_zone == SplitDropZone::left)
+            return {
+                rect.left + inset, rect.top + inset, rect.left + inset + line, rect.bottom - inset};
+        if (visible_drop_zone == SplitDropZone::right)
+            return {rect.right - inset - line,
+                    rect.top + inset,
+                    rect.right - inset,
+                    rect.bottom - inset};
+        if (visible_drop_zone == SplitDropZone::center)
+            return {rect.left + inset, rect.bottom - line, rect.right - inset, rect.bottom};
+        return {};
     }
 
     void HandleTabDrop(const std::size_t index, const POINT point) {
@@ -1344,7 +1365,7 @@ struct TransferPage::Impl {
             return;
         }
         if (const auto insertion = TabInsertionAt(point, index)) {
-            ReorderTab(index, insertion->slot);
+            ReorderTab(index, insertion->slot, insertion->group);
             return;
         }
         const SplitDropZone zone = DropZoneAt(point, static_cast<int>(index));
@@ -1352,7 +1373,9 @@ struct TransferPage::Impl {
             return;
         }
         if (zone == SplitDropZone::center) {
-            const auto target = TabStripAt(point);
+            auto target = TabStripAt(point);
+            if (!target)
+                target = PaneAt(point);
             if (split_active && target && GroupOf(*target) != GroupOf(index)) {
                 pane_groups[index] = GroupOf(*target);
                 active_pane_index = index;
@@ -1400,12 +1423,15 @@ struct TransferPage::Impl {
         }
     }
 
-    void ReorderTab(const std::size_t source, const std::size_t slot) {
+    void ReorderTab(const std::size_t source,
+                    const std::size_t slot,
+                    const std::optional<unsigned> target_group = std::nullopt) {
         if (source >= panes.size() || slot > panes.size()) {
             return;
         }
         const std::size_t destination = DestinationForSlot(source, slot);
-        if (destination == source || destination >= panes.size()) {
+        if ((destination == source && (!target_group || *target_group == GroupOf(source))) ||
+            destination >= panes.size()) {
             return;
         }
 
@@ -1417,6 +1443,8 @@ struct TransferPage::Impl {
             }
         }
         const TransferPaneId moved_id = panes[source].id;
+        if (target_group)
+            pane_groups[source] = *target_group;
         MoveItem(panes, source, destination);
         MoveItem(pane_groups, source, destination);
 
@@ -1444,6 +1472,7 @@ struct TransferPage::Impl {
         const int id = ElementAt(point);
         if (id >= kPaneTabBaseId && id < kPaneTabBaseId + static_cast<int>(panes.size())) {
             dragged_tab = id - kPaneTabBaseId;
+            FocusPaneIndex(static_cast<std::size_t>(dragged_tab));
             tab_drag_origin = point;
             tab_drag_armed = true;
             tab_dragging = false;
@@ -1452,18 +1481,34 @@ struct TransferPage::Impl {
     }
 
     void HandlePointerMove(const POINT point, const WPARAM key_state) {
-        surface.PointerMove(point);
+        if (!tab_dragging)
+            surface.PointerMove(point);
         if (!tab_drag_armed || (key_state & MK_LBUTTON) == 0) {
             return;
         }
-        if (!tab_dragging &&
-            (std::abs(point.x - tab_drag_origin.x) >= GetSystemMetrics(SM_CXDRAG) ||
-             std::abs(point.y - tab_drag_origin.y) >= GetSystemMetrics(SM_CYDRAG))) {
+        if (!tab_dragging && (std::abs(point.x - tab_drag_origin.x) >=
+                                  detail::ScaleForDpi(6, detail::WindowDpi(hwnd)) ||
+                              std::abs(point.y - tab_drag_origin.y) >=
+                                  detail::ScaleForDpi(6, detail::WindowDpi(hwnd)))) {
             tab_dragging = true;
+            for (const auto& element : surface.elements())
+                if (element.id == kPaneTabBaseId + dragged_tab &&
+                    element.role == detail::UiRole::file_tab) {
+                    tab_drag_visual.Begin(hwnd,
+                                          L"SLink.TransferTabDragPreview",
+                                          panes[dragged_tab].title,
+                                          panes[dragged_tab].local ? detail::UiIcon::folder
+                                                                   : detail::UiIcon::server,
+                                          element.bounds,
+                                          tab_drag_origin,
+                                          point);
+                    break;
+                }
         }
         if (!tab_dragging) {
             return;
         }
+        tab_drag_visual.Move(point);
         const auto next_insertion = TabInsertionAt(point, static_cast<std::size_t>(dragged_tab));
         const SplitDropZone next = next_insertion ? SplitDropZone::none : DropZoneAt(point);
         const auto next_pane = next_insertion ? std::nullopt : PaneAt(point);
@@ -1472,18 +1517,33 @@ struct TransferPage::Impl {
             visible_drop_zone = next;
             visible_drop_pane = next_pane;
             visible_tab_insertion = next_insertion;
-            Relayout();
+            RefreshDragHints();
         }
     }
 
     void CancelTabDrag() {
+        const bool redraw = tab_dragging || visible_tab_insertion.has_value() ||
+                            visible_drop_zone != SplitDropZone::none;
         tab_drag_armed = false;
         tab_dragging = false;
         dragged_tab = -1;
         visible_drop_zone = SplitDropZone::none;
         visible_drop_pane.reset();
         visible_tab_insertion.reset();
+        tab_drag_visual.Hide();
         surface.CancelPointer();
+        if (redraw)
+            RefreshDragHints();
+    }
+
+    void RefreshDragHints() {
+        BuildSurface(drag_surface_geometry[0],
+                     drag_surface_geometry[1],
+                     drag_surface_geometry[2],
+                     drag_surface_geometry[3],
+                     drag_surface_geometry[4],
+                     drag_surface_geometry[5]);
+        InvalidateTabStrip();
     }
 
     void HandlePointerUp(const POINT point) {
@@ -1493,7 +1553,6 @@ struct TransferPage::Impl {
         if (dragged && tab >= 0) {
             HandleTabDrop(static_cast<std::size_t>(tab), point);
             CancelTabDrag();
-            Relayout();
             return;
         }
         CancelTabDrag();
@@ -4213,6 +4272,13 @@ struct TransferPage::Impl {
                       const int queue_toolbar_height,
                       const int concurrency_label_x,
                       const int concurrency_label_width) {
+        // 拖动仅重建标签提示，不再移动或重绘文件列表等子窗口。
+        drag_surface_geometry = {width,
+                                 content_left,
+                                 queue_y,
+                                 queue_toolbar_height,
+                                 concurrency_label_x,
+                                 concurrency_label_width};
         detail::TransferSurfaceLayout layout;
         layout.dpi = detail::WindowDpi(hwnd);
         layout.width = width;
@@ -4257,7 +4323,6 @@ struct TransferPage::Impl {
         }
         if (visible_drop_zone != SplitDropZone::none) {
             layout.drop_zone = DropZoneRect();
-            layout.drop_center = visible_drop_zone == SplitDropZone::center;
         }
         if (visible_tab_insertion) {
             layout.insertion = detail::TransferTabInsertion{visible_tab_insertion->x,
@@ -4631,6 +4696,7 @@ void TransferPage::Show(const bool visible) {
         SetTimer(impl_->hwnd, kQueueTimerId, 250, nullptr);
     } else {
         KillTimer(impl_->hwnd, kQueueTimerId);
+        impl_->CancelTabDrag();
     }
     ShowWindow(impl_->hwnd, visible ? SW_SHOW : SW_HIDE);
 }

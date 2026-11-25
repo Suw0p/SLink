@@ -30,6 +30,7 @@ void ResetSharedDcRenderTarget() noexcept;
 enum class UiRole {
     label,
     heading,
+    section_heading,
     muted,
     navigation,
     sidebar_item,
@@ -42,7 +43,6 @@ enum class UiRole {
     toggle,
     panel,
     card,
-    drop_target,
     tab_insert,
     separator,
     accent_line,
@@ -90,6 +90,9 @@ struct UiElement {
     bool status_online{};
     bool compact_text{};
     float text_right_inset{};
+    // 可滚动内容的绘制和命中测试共用同一裁剪范围，避免覆盖固定导航或误点隐藏项。
+    std::optional<D2D1_RECT_F> clip_bounds;
+    bool outlined{};
 };
 
 class UiSurface final {
@@ -112,6 +115,8 @@ public:
     void SetOverlayAccent(std::optional<D2D1_RECT_F> bounds) noexcept;
 
     void Paint(D2D1_COLOR_F clear_color);
+    // WM_PRINTCLIENT 和离屏回归检查复用真实绘制路径，不截取用户桌面。
+    void PaintTo(HDC dc, const RECT& bounds, D2D1_COLOR_F clear_color);
 
     bool PointerMove(POINT point);
     void PointerLeave();
@@ -146,6 +151,28 @@ private:
     int hovered_id_{};
     int pressed_id_{};
     bool tracking_mouse_{};
+};
+
+// 两个页面共用的轻量拖影：开始时画一次，移动只交给窗口合成器，不同步重画正文。
+class TabDragVisual final {
+public:
+    ~TabDragVisual();
+    bool Begin(HWND owner,
+               const wchar_t* class_name,
+               std::wstring_view title,
+               UiIcon icon,
+               D2D1_RECT_F bounds,
+               POINT origin,
+               POINT point) noexcept;
+    void Move(POINT point) noexcept;
+    void Hide() noexcept;
+
+private:
+    static LRESULT CALLBACK WindowProc(HWND, UINT, WPARAM, LPARAM);
+    HWND window_{};
+    HWND owner_{};
+    UiSurface surface_;
+    POINT offset_{};
 };
 
 D2D1_COLOR_F UiColor(COLORREF color, float alpha = 1.0F) noexcept;

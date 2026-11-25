@@ -84,13 +84,11 @@ void BuildTransferPageSurface(UiSurface& surface, const TransferSurfaceLayout& l
     if (layout.drop_zone) {
         const RECT& drop = *layout.drop_zone;
         surface.Add({
-            .role = UiRole::drop_target,
-            .bounds = UiRect(static_cast<float>(drop.left + 8),
-                             static_cast<float>(drop.top + 8),
-                             static_cast<float>(drop.right - 8),
-                             static_cast<float>(drop.bottom - 8)),
-            .text = layout.drop_center ? L"" : L"拖放到此处分屏",
-            .alignment = UiTextAlign::center,
+            .role = UiRole::separator,
+            .bounds = UiRect(static_cast<float>(drop.left),
+                             static_cast<float>(drop.top),
+                             static_cast<float>(drop.right),
+                             static_cast<float>(drop.bottom)),
         });
     }
     if (layout.insertion) {

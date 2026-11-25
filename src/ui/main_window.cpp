@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <commctrl.h>
 #include <cwctype>
 #include <deque>
@@ -110,6 +111,8 @@ struct MainWindow::Impl {
     HINSTANCE instance{};
     HWND hwnd{};
     MainPage active_page{MainPage::Terminal};
+    int settings_scroll_dip{};
+    int settings_scroll_max_dip{};
     detail::UiSurface surface;
     std::unique_ptr<TerminalPage> terminal = std::make_unique<TerminalPage>();
     std::unique_ptr<TransferPage> transfer = std::make_unique<TransferPage>();
@@ -285,6 +288,30 @@ struct MainWindow::Impl {
         case WM_MOUSELEAVE:
             self->surface.PointerLeave();
             return 0;
+        case WM_MOUSEWHEEL:
+            if (self->active_page == MainPage::Settings) {
+                self->ScrollSettings(-MulDiv(GET_WHEEL_DELTA_WPARAM(wparam), 48, WHEEL_DELTA));
+                return 0;
+            }
+            break;
+        case WM_KEYDOWN:
+            if (self->active_page == MainPage::Settings) {
+                switch (wparam) {
+                case VK_NEXT:
+                    self->ScrollSettings(180);
+                    return 0;
+                case VK_PRIOR:
+                    self->ScrollSettings(-180);
+                    return 0;
+                case VK_HOME:
+                    self->ScrollSettings(-self->settings_scroll_max_dip);
+                    return 0;
+                case VK_END:
+                    self->ScrollSettings(self->settings_scroll_max_dip);
+                    return 0;
+                }
+            }
+            break;
         case WM_LBUTTONDOWN:
             if (self->BeginSidebarResize({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)})) {
                 return 0;
@@ -348,6 +375,13 @@ struct MainWindow::Impl {
         case WM_PAINT:
             self->surface.Paint(detail::UiColor(detail::kWindowColor));
             return 0;
+        case WM_PRINTCLIENT: {
+            RECT bounds{};
+            GetClientRect(window, &bounds);
+            self->surface.PaintTo(
+                reinterpret_cast<HDC>(wparam), bounds, detail::UiColor(detail::kWindowColor));
+            return 0;
+        }
         case WM_ERASEBKGND:
             return 1;
         case WM_CLOSE:
@@ -1023,6 +1057,7 @@ struct MainWindow::Impl {
             port_forward->Show(true);
             break;
         case MainPage::Settings:
+            SetFocus(hwnd);
             break;
         }
     }
@@ -1310,146 +1345,112 @@ struct MainWindow::Impl {
             return;
         }
 
-        const float content_top = static_cast<float>(nav_height);
-        const float card_width = std::min(680.0F * scale, static_cast<float>(width) - 64.0F);
-        const float card_height = 386.0F * scale;
-        const float card_left = (static_cast<float>(width) - card_width) / 2.0F;
-        const float card_top =
-            content_top +
-            std::max(36.0F * scale, (static_cast<float>(height - nav_height) - card_height) / 2.0F);
-        surface.Add({
-            .role = detail::UiRole::card,
-            .bounds =
-                detail::UiRect(card_left, card_top, card_left + card_width, card_top + card_height),
-        });
-        surface.Add({
-            .role = detail::UiRole::heading,
-            .bounds = detail::UiRect(card_left + 30.0F * scale,
-                                     card_top + 24.0F * scale,
-                                     card_left + card_width - 30.0F * scale,
-                                     card_top + 62.0F * scale),
-            .text = L"设置",
-            .alignment = detail::UiTextAlign::leading,
-        });
-        const float version_right = card_left + card_width - 30.0F * scale;
-        const float version_left =
-            std::max(card_left + 90.0F * scale, version_right - 120.0F * scale);
-        if (version_right - version_left >= 56.0F * scale) {
-            surface.Add({
-                .role = detail::UiRole::muted,
-                .bounds = detail::UiRect(version_left,
-                                         card_top + 24.0F * scale,
-                                         version_right,
-                                         card_top + 62.0F * scale),
-                .text = version::kDisplay,
-                .alignment = detail::UiTextAlign::trailing,
-            });
+        BuildSettingsSurface(width, height, nav_height, scale);
+    }
+
+    void BuildSettingsSurface(int width, int height, int nav_height, float scale) {
+        // 紧凑的设置行：左侧名称，右侧控件；不使用装饰性大卡片或主题缩略图。
+        const float margin = (width < 620.0F * scale ? 20.0F : 40.0F) * scale;
+        const float column_width = std::max(1.0F, std::min(560.0F * scale, width - 2.0F * margin));
+        const float left = (width - column_width) / 2.0F, right = left + column_width;
+        const float top = nav_height + (height < 540.0F * scale ? 22.0F : 40.0F) * scale;
+        surface.Add(
+            {.role = detail::UiRole::heading,
+             .bounds = detail::UiRect(
+                 left, top, std::max(left + 1.0F, right - 96.0F * scale), top + 32.0F * scale),
+             .text = L"设置"});
+        surface.Add(
+            {.role = detail::UiRole::muted,
+             .bounds = detail::UiRect(std::max(left + 80.0F * scale, right - 100.0F * scale),
+                                      top,
+                                      right,
+                                      top + 32.0F * scale),
+             .text = version::kDisplay,
+             .alignment = detail::UiTextAlign::trailing});
+        const float body_top = top + 64.0F * scale;
+        const float body_bottom = std::max(body_top + 1.0F, height - 22.0F * scale);
+        const bool stacked_action = column_width < 300.0F * scale;
+        const float content_height = stacked_action ? 294.0F : 242.0F;
+        settings_scroll_max_dip = static_cast<int>(
+            std::ceil(std::max(0.0F, content_height - (body_bottom - body_top) / scale)));
+        settings_scroll_dip = std::clamp(settings_scroll_dip, 0, settings_scroll_max_dip);
+        const auto y = [&](float dip) {
+            return body_top + (dip - settings_scroll_dip) * scale;
+        };
+        const auto add = [&](detail::UiElement element) {
+            element.clip_bounds = detail::UiRect(left, body_top - 2.0F * scale, right, body_bottom);
+            surface.Add(std::move(element));
+        };
+        add({.role = detail::UiRole::section_heading,
+             .bounds = detail::UiRect(left, y(0), right - 178.0F * scale, y(36)),
+             .text = L"主题"});
+        const float selector_left = right - 178.0F * scale;
+        add({.role = detail::UiRole::card,
+             .bounds = detail::UiRect(selector_left, y(0), right - 10.0F * scale, y(36))});
+        add({.id = kDarkThemeId,
+             .role = detail::UiRole::tab,
+             .bounds = detail::UiRect(
+                 selector_left + 3.0F * scale, y(3), selector_left + 81.0F * scale, y(33)),
+             .text = L"深色",
+             .alignment = detail::UiTextAlign::center,
+             .selected = selected_theme == theme::Mode::Dark});
+        add({.id = kLightThemeId,
+             .role = detail::UiRole::tab,
+             .bounds = detail::UiRect(
+                 selector_left + 87.0F * scale, y(3), selector_left + 165.0F * scale, y(33)),
+             .text = L"浅色",
+             .alignment = detail::UiTextAlign::center,
+             .selected = selected_theme == theme::Mode::Light});
+        add({.role = detail::UiRole::separator,
+             .bounds = detail::UiRect(
+                 left + 10.0F * scale, y(60), right - 10.0F * scale, y(60) + scale)});
+        add({.role = detail::UiRole::label,
+             .bounds = detail::UiRect(left, y(82), right - 70.0F * scale, y(106)),
+             .text = L"服务器不分组"});
+        add({.role = detail::UiRole::muted,
+             .bounds = detail::UiRect(left, y(108), right - 66.0F * scale, y(132)),
+             .text = L"仅改变侧栏显示"});
+        add({.id = kServerUngroupedId,
+             .role = detail::UiRole::toggle,
+             .bounds = detail::UiRect(right - 52.0F * scale, y(96), right - 10.0F * scale, y(118)),
+             .selected = server_ungrouped});
+        add({.role = detail::UiRole::separator,
+             .bounds = detail::UiRect(
+                 left + 10.0F * scale, y(154), right - 10.0F * scale, y(154) + scale)});
+        const float text_right = stacked_action ? right : right - 140.0F * scale;
+        add({.role = detail::UiRole::label,
+             .bounds = detail::UiRect(left, y(176), text_right, y(200)),
+             .text = L"服务器管理"});
+        add({.role = detail::UiRole::muted,
+             .bounds = detail::UiRect(left, y(202), text_right, y(226)),
+             .text = L"连接与分组"});
+        const float button_left = stacked_action ? left + 10.0F * scale : right - 126.0F * scale;
+        const float button_top = stacked_action ? 244.0F : 184.0F;
+        add({.id = kManageServersId,
+             .role = detail::UiRole::ghost_button,
+             .bounds = detail::UiRect(
+                 button_left, y(button_top), button_left + 116.0F * scale, y(button_top + 34)),
+             .text = L"打开管理",
+             .alignment = detail::UiTextAlign::center,
+             .outlined = true});
+        if (settings_scroll_max_dip > 0) {
+            const float track = body_bottom - body_top;
+            const float thumb = std::max(24.0F * scale, track * track / (content_height * scale));
+            const float thumb_top =
+                body_top + (track - thumb) * settings_scroll_dip / settings_scroll_max_dip;
+            surface.Add(
+                {.role = detail::UiRole::separator,
+                 .bounds = detail::UiRect(
+                     width - 8.0F * scale, thumb_top, width - 5.0F * scale, thumb_top + thumb)});
         }
-        surface.Add({
-            .role = detail::UiRole::heading,
-            .bounds = detail::UiRect(card_left + 30.0F * scale,
-                                     card_top + 76.0F * scale,
-                                     card_left + card_width - 30.0F * scale,
-                                     card_top + 108.0F * scale),
-            .text = L"外观",
-            .alignment = detail::UiTextAlign::leading,
-        });
-        surface.Add({
-            .role = detail::UiRole::label,
-            .bounds = detail::UiRect(card_left + 30.0F * scale,
-                                     card_top + 116.0F * scale,
-                                     card_left + 116.0F * scale,
-                                     card_top + 156.0F * scale),
-            .text = L"主题",
-            .alignment = detail::UiTextAlign::leading,
-        });
-        const float theme_left = card_left + 126.0F * scale;
-        const float theme_width = 132.0F * scale;
-        surface.Add({
-            .id = kDarkThemeId,
-            .role = detail::UiRole::tab,
-            .bounds = detail::UiRect(theme_left,
-                                     card_top + 116.0F * scale,
-                                     theme_left + theme_width,
-                                     card_top + 156.0F * scale),
-            .text = L"深色",
-            .alignment = detail::UiTextAlign::center,
-            .selected = selected_theme == theme::Mode::Dark,
-        });
-        surface.Add({
-            .id = kLightThemeId,
-            .role = detail::UiRole::tab,
-            .bounds = detail::UiRect(theme_left + theme_width + 10.0F * scale,
-                                     card_top + 116.0F * scale,
-                                     theme_left + theme_width * 2.0F + 10.0F * scale,
-                                     card_top + 156.0F * scale),
-            .text = L"浅色",
-            .alignment = detail::UiTextAlign::center,
-            .selected = selected_theme == theme::Mode::Light,
-        });
-        surface.Add({
-            .role = detail::UiRole::muted,
-            .bounds = detail::UiRect(theme_left,
-                                     card_top + 162.0F * scale,
-                                     card_left + card_width - 30.0F * scale,
-                                     card_top + 192.0F * scale),
-            .text = L"当前正在使用此主题",
-            .alignment = detail::UiTextAlign::leading,
-        });
-        surface.Add({
-            .role = detail::UiRole::separator,
-            .bounds = detail::UiRect(card_left + 30.0F * scale,
-                                     card_top + 212.0F * scale,
-                                     card_left + card_width - 30.0F * scale,
-                                     card_top + 213.0F * scale),
-        });
-        surface.Add({
-            .role = detail::UiRole::heading,
-            .bounds = detail::UiRect(card_left + 30.0F * scale,
-                                     card_top + 228.0F * scale,
-                                     card_left + card_width - 30.0F * scale,
-                                     card_top + 260.0F * scale),
-            .text = L"服务器",
-            .alignment = detail::UiTextAlign::leading,
-        });
-        surface.Add({
-            .role = detail::UiRole::label,
-            .bounds = detail::UiRect(card_left + 30.0F * scale,
-                                     card_top + 266.0F * scale,
-                                     card_left + card_width - 100.0F * scale,
-                                     card_top + 300.0F * scale),
-            .text = L"服务器不分组",
-            .alignment = detail::UiTextAlign::leading,
-        });
-        surface.Add({
-            .id = kServerUngroupedId,
-            .role = detail::UiRole::toggle,
-            .bounds = detail::UiRect(card_left + card_width - 88.0F * scale,
-                                     card_top + 271.0F * scale,
-                                     card_left + card_width - 42.0F * scale,
-                                     card_top + 295.0F * scale),
-            .selected = server_ungrouped,
-        });
-        surface.Add({
-            .role = detail::UiRole::muted,
-            .bounds = detail::UiRect(card_left + 30.0F * scale,
-                                     card_top + 304.0F * scale,
-                                     card_left + card_width - 210.0F * scale,
-                                     card_top + 348.0F * scale),
-            .text = L"仅改变侧栏显示，保留已有分组。",
-            .alignment = detail::UiTextAlign::leading,
-        });
-        surface.Add({
-            .id = kManageServersId,
-            .role = detail::UiRole::primary_button,
-            .bounds = detail::UiRect(card_left + card_width - 190.0F * scale,
-                                     card_top + 316.0F * scale,
-                                     card_left + card_width - 30.0F * scale,
-                                     card_top + 358.0F * scale),
-            .text = L"服务器管理",
-            .icon = detail::UiIcon::server,
-            .alignment = detail::UiTextAlign::center,
-        });
+    }
+
+    void ScrollSettings(int delta) {
+        const int next = std::clamp(settings_scroll_dip + delta, 0, settings_scroll_max_dip);
+        if (next == settings_scroll_dip)
+            return;
+        settings_scroll_dip = next;
+        CommitLayoutNow();
     }
 
     void Layout(int width, int height) {

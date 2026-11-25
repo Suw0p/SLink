@@ -267,8 +267,12 @@ void UiSurface::Paint(const D2D1_COLOR_F clear_color) {
     BeginPaint(window_, &paint);
     RECT bounds{};
     GetClientRect(window_, &bounds);
-    if (!EnsureDeviceResources(paint.hdc, bounds)) {
-        EndPaint(window_, &paint);
+    PaintTo(paint.hdc, bounds, clear_color);
+    EndPaint(window_, &paint);
+}
+
+void UiSurface::PaintTo(HDC dc, const RECT& bounds, const D2D1_COLOR_F clear_color) {
+    if (!EnsureDeviceResources(dc, bounds)) {
         return;
     }
 
@@ -277,7 +281,12 @@ void UiSurface::Paint(const D2D1_COLOR_F clear_color) {
     target_->Clear(clear_color);
     for (const UiElement& element : elements_) {
         if (element.visible && Width(element.bounds) > 0.0F && Height(element.bounds) > 0.0F) {
+            if (element.clip_bounds)
+                target_->PushAxisAlignedClip(*element.clip_bounds,
+                                             D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             DrawElement(element);
+            if (element.clip_bounds)
+                target_->PopAxisAlignedClip();
         }
     }
     if (overlay_accent_ && Width(*overlay_accent_) > 0.0F && Height(*overlay_accent_) > 0.0F) {
@@ -290,7 +299,6 @@ void UiSurface::Paint(const D2D1_COLOR_F clear_color) {
     if (result == D2DERR_RECREATE_TARGET) {
         ResetSharedDcRenderTarget();
     }
-    EndPaint(window_, &paint);
 }
 
 void UiSurface::SetOverlayAccent(std::optional<D2D1_RECT_F> bounds) noexcept {
@@ -323,6 +331,7 @@ void UiSurface::DrawElement(const UiElement& element) {
 
     switch (element.role) {
     case UiRole::heading:
+    case UiRole::section_heading:
         text_color = kTextStrong;
         break;
     case UiRole::muted:
@@ -366,12 +375,15 @@ void UiSurface::DrawElement(const UiElement& element) {
     case UiRole::icon_button:
         fill = pressed ? kAccentSoft : (hovered ? kPanelHover : kPanelRaised);
         border = hovered ? kBorderBright : kBorder;
-        border_width = hovered ? 1.0F : 0.0F;
+        border_width = hovered || element.outlined ? 1.0F : 0.0F;
         radius = 7.0F;
         break;
     case UiRole::toggle:
-        fill = element.selected ? kAccent : (hovered ? kPanelHover : kPanelRaised);
-        border = element.selected ? kAccentHover : kBorder;
+        fill = element.selected ? kAccent
+                                : (theme::IsDark() ? (hovered ? kPanelHover : kPanelRaised)
+                                                   : D2D1::ColorF(0xe0e1e5));
+        border =
+            element.selected ? kAccentHover : (theme::IsDark() ? kBorder : D2D1::ColorF(0xd1d2d7));
         border_width = 1.0F;
         radius = std::max(1.0F, Height(element.bounds) / 2.0F);
         break;
@@ -393,14 +405,8 @@ void UiSurface::DrawElement(const UiElement& element) {
         border_width = 1.0F;
         radius = 12.0F;
         break;
-    case UiRole::drop_target:
-        fill = ThemeColor(theme::kAccentColor, 0.28F);
-        border = kAccentHover;
-        border_width = 2.0F;
-        radius = 6.0F;
-        break;
     case UiRole::tab_insert:
-        fill = kAccentHover;
+        fill = kMuted;
         radius = 1.0F;
         break;
     case UiRole::separator:
@@ -480,8 +486,9 @@ void UiSurface::DrawText(const UiElement& element, D2D1_RECT_F bounds, ID2D1Brus
     IDWriteTextFormat* format = body_format_;
     if (element.role == UiRole::heading) {
         format = heading_format_;
-    } else if (element.role == UiRole::navigation || element.role == UiRole::tab ||
-               element.role == UiRole::file_tab || element.role == UiRole::primary_button) {
+    } else if (element.role == UiRole::section_heading || element.role == UiRole::navigation ||
+               element.role == UiRole::tab || element.role == UiRole::file_tab ||
+               element.role == UiRole::primary_button) {
         format = element.role == UiRole::file_tab && element.compact_text ? compact_tab_format_
                                                                           : semibold_format_;
     } else if (element.role == UiRole::muted || element.role == UiRole::status) {
@@ -623,6 +630,10 @@ const UiElement* UiSurface::HitTest(const POINT point) const noexcept {
         if (!element.visible || !element.enabled || element.id == 0 || !Interactive(element.role)) {
             continue;
         }
+        if (element.clip_bounds &&
+            (point.x < element.clip_bounds->left || point.x >= element.clip_bounds->right ||
+             point.y < element.clip_bounds->top || point.y >= element.clip_bounds->bottom))
+            continue;
         if (point.x >= element.bounds.left && point.x < element.bounds.right &&
             point.y >= element.bounds.top && point.y < element.bounds.bottom) {
             return &element;
@@ -669,12 +680,14 @@ bool UiSurface::PointerDown(const POINT point) {
 std::optional<int> UiSurface::PointerUp(const POINT point) {
     const int pressed = pressed_id_;
     const UiElement* element = HitTest(point);
+    // ReleaseCapture 会同步回调页面，页面可能重建 elements_，不能再解引用旧元素。
+    const int released_id = element ? element->id : 0;
     pressed_id_ = 0;
     if (GetCapture() == window_) {
         ReleaseCapture();
     }
     InvalidateRect(window_, nullptr, FALSE);
-    if (pressed != 0 && element && element->id == pressed) {
+    if (pressed != 0 && released_id == pressed) {
         return pressed;
     }
     return std::nullopt;
@@ -686,6 +699,112 @@ void UiSurface::CancelPointer() {
         ReleaseCapture();
     }
     InvalidateRect(window_, nullptr, FALSE);
+}
+
+TabDragVisual::~TabDragVisual() {
+    if (window_ && IsWindow(window_))
+        DestroyWindow(window_);
+}
+
+LRESULT CALLBACK TabDragVisual::WindowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    auto* self = reinterpret_cast<TabDragVisual*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        self = static_cast<TabDragVisual*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+    }
+    if (!self)
+        return DefWindowProcW(window, message, wp, lp);
+    if (message == WM_PAINT) {
+        self->surface_.Paint(UiColor(theme::kPanelColor));
+        return 0;
+    }
+    if (message == WM_ERASEBKGND)
+        return 1;
+    if (message == WM_DPICHANGED)
+        self->surface_.DpiChanged();
+    if (message == WM_NCDESTROY) {
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        self->window_ = nullptr;
+    }
+    return DefWindowProcW(window, message, wp, lp);
+}
+
+bool TabDragVisual::Begin(HWND owner,
+                          const wchar_t* class_name,
+                          std::wstring_view title,
+                          UiIcon icon,
+                          D2D1_RECT_F bounds,
+                          POINT origin,
+                          POINT point) noexcept {
+    try {
+        owner_ = owner;
+        if (!window_) {
+            WNDCLASSEXW type{sizeof(type)};
+            type.lpfnWndProc = WindowProc;
+            type.hInstance = GetModuleHandleW(nullptr);
+            type.lpszClassName = class_name;
+            if (!RegisterClassExW(&type) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+                return false;
+            window_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+                                          WS_EX_TRANSPARENT,
+                                      class_name,
+                                      L"",
+                                      WS_POPUP,
+                                      0,
+                                      0,
+                                      1,
+                                      1,
+                                      owner,
+                                      nullptr,
+                                      type.hInstance,
+                                      this);
+            if (!window_)
+                return false;
+            if (!surface_.Initialize(window_)) {
+                DestroyWindow(window_);
+                window_ = nullptr;
+                return false;
+            }
+            SetLayeredWindowAttributes(window_, 0, 224, LWA_ALPHA);
+        }
+        const int width = std::max(1, static_cast<int>(bounds.right - bounds.left));
+        const int height = std::max(1, static_cast<int>(bounds.bottom - bounds.top));
+        offset_ = {std::clamp(static_cast<int>(origin.x - bounds.left), 0, width - 1),
+                   std::clamp(static_cast<int>(origin.y - bounds.top), 0, height - 1)};
+        surface_.ClearElements();
+        surface_.Add({.role = UiRole::file_tab,
+                      .bounds = UiRect(0, 0, static_cast<float>(width), static_cast<float>(height)),
+                      .text = std::wstring(title),
+                      .icon = icon,
+                      .selected = true,
+                      .compact_text = true});
+        SetWindowPos(
+            window_, nullptr, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        Move(point);
+        RedrawWindow(window_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+        return true;
+    } catch (...) {
+        Hide();
+        return false;
+    }
+}
+
+void TabDragVisual::Move(POINT point) noexcept {
+    if (!window_ || !owner_)
+        return;
+    ClientToScreen(owner_, &point);
+    SetWindowPos(window_,
+                 HWND_TOPMOST,
+                 point.x - offset_.x,
+                 point.y - offset_.y,
+                 0,
+                 0,
+                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOREDRAW);
+}
+
+void TabDragVisual::Hide() noexcept {
+    if (window_)
+        ShowWindow(window_, SW_HIDE);
 }
 
 int UiSurface::hovered_id() const noexcept {

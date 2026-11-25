@@ -736,6 +736,14 @@ struct EditorPage::Impl {
             self->surface.Paint(detail::UiColor(detail::kWindowColor));
             return 0;
         }
+        case WM_PRINTCLIENT: {
+            RECT bounds{};
+            GetClientRect(window, &bounds);
+            self->BuildSurface(bounds.right, bounds.bottom);
+            self->surface.PaintTo(
+                reinterpret_cast<HDC>(wparam), bounds, detail::UiColor(detail::kWindowColor));
+            return 0;
+        }
         default:
             break;
         }
@@ -2304,22 +2312,21 @@ struct EditorPage::Impl {
                        !ActiveDocument()->read_only && !ActiveDocument()->saving &&
                        !ActiveDocument()->closing,
         });
-        if (!current) {
+        if (!current && !scintilla_available) {
             const float middle = static_cast<float>(m.editor_y + m.editor_height / 2);
             surface.Add({.role = detail::UiRole::heading,
                          .bounds = detail::UiRect(static_cast<float>(right_x),
                                                   middle - 42.0F * scale,
                                                   static_cast<float>(right_x + right_width),
                                                   middle),
-                         .text = scintilla_available ? L"打开文件，开始编辑" : L"编辑器组件未加载",
+                         .text = L"编辑器组件未加载",
                          .alignment = detail::UiTextAlign::center});
             surface.Add({.role = detail::UiRole::muted,
                          .bounds = detail::UiRect(static_cast<float>(right_x),
                                                   middle + 5.0F * scale,
                                                   static_cast<float>(right_x + right_width),
                                                   middle + 38.0F * scale),
-                         .text = scintilla_available ? L"双击左侧文件打开 · Ctrl+S 保存"
-                                                     : L"请检查 Scintilla.dll 和 Lexilla.dll",
+                         .text = L"请检查 Scintilla.dll 和 Lexilla.dll",
                          .alignment = detail::UiTextAlign::center});
         }
 

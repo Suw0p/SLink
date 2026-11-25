@@ -3,13 +3,14 @@
 
 #include "ui/retained_ui.hpp"
 #include "ui/selector_control.hpp"
-#include "ui/terminal_tab_viewport.hpp"
 #include "ui/terminal_control.hpp"
+#include "ui/terminal_tab_viewport.hpp"
 #include "ui/win32_ui_internal.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <commctrl.h>
 #include <cstdlib>
 #include <iterator>
 #include <limits>
@@ -19,7 +20,6 @@
 #include <utility>
 #include <vector>
 #include <windowsx.h>
-#include <commctrl.h>
 
 namespace SLink::ui {
 namespace {
@@ -52,7 +52,12 @@ enum class SplitDropZone {
     center,
 };
 
-enum class TabHitKind { activate, close, scroll_left, scroll_right };
+enum class TabHitKind {
+    activate,
+    close,
+    scroll_left,
+    scroll_right
+};
 
 struct TabHitAction {
     int id{};
@@ -126,6 +131,7 @@ struct TerminalPage::Impl {
 
     struct TabInsertionTarget {
         std::size_t slot{};
+        unsigned group{};
         float x{};
         float top{};
         float bottom{};
@@ -134,10 +140,7 @@ struct TerminalPage::Impl {
     HINSTANCE instance{};
     HWND hwnd{};
     detail::UiSurface surface;
-    HWND tab_drag_preview{};
-    detail::UiSurface tab_drag_surface;
-    SIZE tab_drag_preview_size{};
-    POINT tab_drag_preview_offset{};
+    detail::TabDragVisual tab_drag_visual;
     unsigned columns{1};
     bool split_active{};
     std::vector<std::string> server_ids;
@@ -196,9 +199,6 @@ struct TerminalPage::Impl {
     PaneCreatedCallback pane_created;
 
     ~Impl() {
-        if (tab_drag_preview && IsWindow(tab_drag_preview)) {
-            DestroyWindow(tab_drag_preview);
-        }
         DeleteObject(selector_font);
     }
 
@@ -324,36 +324,6 @@ struct TerminalPage::Impl {
         NormalizeGroups();
     }
 
-    static LRESULT CALLBACK TabDragPreviewProc(HWND window,
-                                               UINT message,
-                                               WPARAM wparam,
-                                               LPARAM lparam) {
-        auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-        if (message == WM_NCCREATE) {
-            const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
-            self = static_cast<Impl*>(create->lpCreateParams);
-            SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
-        }
-        if (!self) {
-            return DefWindowProcW(window, message, wparam, lparam);
-        }
-        switch (message) {
-        case WM_SIZE:
-            self->tab_drag_surface.Resize(LOWORD(lparam), HIWORD(lparam));
-            return 0;
-        case WM_DPICHANGED_AFTERPARENT:
-            self->tab_drag_surface.DpiChanged();
-            return 0;
-        case WM_PAINT:
-            self->tab_drag_surface.Paint(detail::UiColor(detail::kWindowColor));
-            return 0;
-        case WM_ERASEBKGND:
-            return 1;
-        default:
-            return DefWindowProcW(window, message, wparam, lparam);
-        }
-    }
-
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(window, GWLP_USERDATA));
         if (message == WM_NCCREATE) {
@@ -391,9 +361,13 @@ struct TerminalPage::Impl {
             KillTimer(window, kTabMotionTimerId);
             KillTimer(window, kDragScrollTimerId);
             break;
+        case WM_CANCELMODE:
+            self->CancelDrag();
+            self->surface.CancelPointer();
+            return 0;
         case WM_NOTIFY:
-            if (self->tab_tooltip && reinterpret_cast<NMHDR*>(lparam)->hwndFrom ==
-                                         self->tab_tooltip &&
+            if (self->tab_tooltip &&
+                reinterpret_cast<NMHDR*>(lparam)->hwndFrom == self->tab_tooltip &&
                 reinterpret_cast<NMHDR*>(lparam)->code == TTN_GETDISPINFOW) {
                 auto* info = reinterpret_cast<NMTTDISPINFOW*>(lparam);
                 POINT cursor{};
@@ -717,9 +691,10 @@ struct TerminalPage::Impl {
 
     bool HandlePointerDown(POINT point) {
         const int id = ElementAt(point);
-        if (const auto* action = ActionForId(id);
-            action && action->kind == TabHitKind::activate) {
-            dragged_tab = static_cast<int>(action->pane_index);
+        if (const auto* action = ActionForId(id); action && action->kind == TabHitKind::activate) {
+            const auto index = action->pane_index;
+            Focus(index);
+            dragged_tab = static_cast<int>(index);
             tab_drag_origin = point;
             tab_drag_current = point;
             tab_drag_armed = true;
@@ -729,13 +704,15 @@ struct TerminalPage::Impl {
     }
 
     void HandlePointerMove(POINT point, WPARAM key_state) {
-        surface.PointerMove(point);
+        if (!tab_dragging)
+            surface.PointerMove(point);
         if (!tab_drag_armed || (key_state & MK_LBUTTON) == 0) {
             return;
         }
-        if (!tab_dragging &&
-            (std::abs(point.x - tab_drag_origin.x) >= GetSystemMetrics(SM_CXDRAG) ||
-             std::abs(point.y - tab_drag_origin.y) >= GetSystemMetrics(SM_CYDRAG))) {
+        if (!tab_dragging && (std::abs(point.x - tab_drag_origin.x) >=
+                                  detail::ScaleForDpi(6, detail::WindowDpi(hwnd)) ||
+                              std::abs(point.y - tab_drag_origin.y) >=
+                                  detail::ScaleForDpi(6, detail::WindowDpi(hwnd)))) {
             tab_dragging = true;
             BeginTabDragPreview(point);
         }
@@ -750,17 +727,11 @@ struct TerminalPage::Impl {
         const SplitDropZone next = next_insertion ? SplitDropZone::none : DropZoneAt(point);
         if (next != visible_drop_zone || next_pane != visible_drop_pane ||
             !SameInsertion(next_insertion, visible_tab_insertion)) {
-            const bool strip_only = next == SplitDropZone::none &&
-                                    visible_drop_zone == SplitDropZone::none;
             visible_drop_zone = next;
             visible_drop_pane = next_pane;
             visible_tab_insertion = next_insertion;
             BuildElements();
-            if (strip_only) {
-                InvalidateTabStrip();
-            } else {
-                InvalidateRect(hwnd, nullptr, FALSE);
-            }
+            InvalidateTabStrip();
         }
     }
 
@@ -831,9 +802,9 @@ struct TerminalPage::Impl {
         if (!tab_overflow[group]) {
             return std::nullopt;
         }
-        if (const auto* action = ActionForId(ElementAt(point)); action &&
-            (action->kind == TabHitKind::scroll_left ||
-             action->kind == TabHitKind::scroll_right)) {
+        if (const auto* action = ActionForId(ElementAt(point));
+            action &&
+            (action->kind == TabHitKind::scroll_left || action->kind == TabHitKind::scroll_right)) {
             return {{group, action->kind == TabHitKind::scroll_left ? -1 : 1}};
         }
         const RECT& region = tab_visible_regions[group];
@@ -889,121 +860,33 @@ struct TerminalPage::Impl {
         dragged_tab = -1;
         visible_drop_pane.reset();
         visible_tab_insertion.reset();
-        if (tab_drag_preview) {
-            ShowWindow(tab_drag_preview, SW_HIDE);
-        }
+        tab_drag_visual.Hide();
         if (had_drop_visual) {
             visible_drop_zone = SplitDropZone::none;
             BuildElements();
-            InvalidateRect(hwnd, nullptr, FALSE);
+            InvalidateTabStrip();
         }
-    }
-
-    bool EnsureTabDragPreview() {
-        if (tab_drag_preview) {
-            return true;
-        }
-        WNDCLASSEXW wc{sizeof(wc)};
-        wc.style = CS_HREDRAW | CS_VREDRAW;
-        wc.lpfnWndProc = &TabDragPreviewProc;
-        wc.hInstance = instance;
-        wc.hCursor = LoadCursorW(nullptr, IDC_SIZEALL);
-        wc.lpszClassName = kTabDragPreviewClass;
-        const ATOM atom = RegisterClassExW(&wc);
-        if (atom == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-            return false;
-        }
-        tab_drag_preview =
-            CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-                            kTabDragPreviewClass,
-                            L"",
-                            WS_POPUP,
-                            0,
-                            0,
-                            1,
-                            1,
-                            hwnd,
-                            nullptr,
-                            instance,
-                            this);
-        if (!tab_drag_preview || !tab_drag_surface.Initialize(tab_drag_preview)) {
-            return false;
-        }
-        SetLayeredWindowAttributes(tab_drag_preview, 0, 224, LWA_ALPHA);
-        return true;
     }
 
     void BeginTabDragPreview(POINT point) {
-        if (dragged_tab < 0 || static_cast<std::size_t>(dragged_tab) >= pane_titles.size() ||
-            !EnsureTabDragPreview()) {
+        if (dragged_tab < 0 || static_cast<std::size_t>(dragged_tab) >= pane_titles.size())
             return;
-        }
-        const UINT dpi = detail::WindowDpi(hwnd);
-        int preview_width = detail::ScaleForDpi(110, dpi);
-        int preview_height = detail::ScaleForDpi(30, dpi);
-        tab_drag_preview_offset = {detail::ScaleForDpi(30, dpi), detail::ScaleForDpi(18, dpi)};
-        const int tab_id = static_cast<std::size_t>(dragged_tab) < pane_tab_element_ids.size()
-                               ? pane_tab_element_ids[dragged_tab]
-                               : 0;
-        for (const auto& element : surface.elements()) {
-            if (element.id != tab_id || element.role != detail::UiRole::file_tab) {
-                continue;
+        const auto id = pane_tab_element_ids[dragged_tab];
+        for (const auto& element : surface.elements())
+            if (element.id == id && element.role == detail::UiRole::file_tab) {
+                tab_drag_visual.Begin(hwnd,
+                                      kTabDragPreviewClass,
+                                      pane_titles[dragged_tab],
+                                      detail::UiIcon::terminal,
+                                      element.bounds,
+                                      tab_drag_origin,
+                                      point);
+                return;
             }
-            preview_width =
-                std::max(1, static_cast<int>(element.bounds.right - element.bounds.left));
-            preview_height =
-                std::max(1, static_cast<int>(element.bounds.bottom - element.bounds.top));
-            tab_drag_preview_offset.x = std::clamp<int>(static_cast<int>(tab_drag_origin.x) -
-                                                            static_cast<int>(element.bounds.left),
-                                                        0,
-                                                        preview_width - 1);
-            tab_drag_preview_offset.y = std::clamp<int>(static_cast<int>(tab_drag_origin.y) -
-                                                            static_cast<int>(element.bounds.top),
-                                                        0,
-                                                        preview_height - 1);
-            break;
-        }
-        tab_drag_preview_size = {preview_width, preview_height};
-        tab_drag_surface.ClearElements();
-        tab_drag_surface.Add({
-            .role = detail::UiRole::file_tab,
-            .bounds = detail::UiRect(
-                0.0F, 0.0F, static_cast<float>(preview_width), static_cast<float>(preview_height)),
-            .text = pane_titles[static_cast<std::size_t>(dragged_tab)],
-            .icon = detail::UiIcon::terminal,
-            .alignment = detail::UiTextAlign::leading,
-            .selected = true,
-            .compact_text = true,
-        });
-        const float close_size = static_cast<float>(detail::ScaleForDpi(18, dpi));
-        tab_drag_surface.Add({
-            .role = detail::UiRole::tab_close,
-            .bounds = detail::UiRect(
-                static_cast<float>(preview_width) - close_size - detail::ScaleForDpi(4, dpi),
-                (preview_height - close_size) / 2.0F,
-                static_cast<float>(preview_width) - detail::ScaleForDpi(4, dpi),
-                (preview_height + close_size) / 2.0F),
-            .icon = detail::UiIcon::close,
-            .alignment = detail::UiTextAlign::center,
-        });
-        MoveTabDragPreview(point);
     }
 
     void MoveTabDragPreview(POINT point) {
-        if (!tab_drag_preview || tab_drag_preview_size.cx <= 0 || tab_drag_preview_size.cy <= 0) {
-            return;
-        }
-        POINT screen = point;
-        ClientToScreen(hwnd, &screen);
-        SetWindowPos(tab_drag_preview,
-                     HWND_TOPMOST,
-                     screen.x - tab_drag_preview_offset.x,
-                     screen.y - tab_drag_preview_offset.y,
-                     tab_drag_preview_size.cx,
-                     tab_drag_preview_size.cy,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
-        RedrawWindow(
-            tab_drag_preview, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+        tab_drag_visual.Move(point);
     }
 
     std::optional<std::size_t> PaneAt(POINT point) const noexcept {
@@ -1037,7 +920,11 @@ struct TerminalPage::Impl {
                 continue;
             }
             RECT strip = pane_rects[index];
-            strip.bottom = std::min(strip.bottom, strip.top + tab_height);
+            strip.top =
+                std::max<LONG>(0, strip.top - detail::ScaleForDpi(8, detail::WindowDpi(hwnd)));
+            strip.bottom = std::min(strip.bottom,
+                                    pane_rects[index].top + tab_height +
+                                        detail::ScaleForDpi(12, detail::WindowDpi(hwnd)));
             if (PtInRect(&strip, point)) {
                 return index;
             }
@@ -1050,8 +937,9 @@ struct TerminalPage::Impl {
         if (left.has_value() != right.has_value()) {
             return false;
         }
-        return !left || (left->slot == right->slot && left->x == right->x &&
-                         left->top == right->top && left->bottom == right->bottom);
+        return !left ||
+               (left->slot == right->slot && left->group == right->group && left->x == right->x &&
+                left->top == right->top && left->bottom == right->bottom);
     }
 
     static std::size_t DestinationForSlot(const std::size_t source,
@@ -1062,10 +950,10 @@ struct TerminalPage::Impl {
     std::optional<TabInsertionTarget> TabInsertionAt(const POINT point,
                                                      const std::size_t source) const {
         const auto strip = TabStripAt(point);
-        if (!strip || source >= panes.size() || GroupOf(*strip) != GroupOf(source)) {
+        if (!strip || source >= panes.size()) {
             return std::nullopt;
         }
-        const RECT& visible_region = tab_visible_regions[GroupOf(source)];
+        const RECT& visible_region = tab_visible_regions[GroupOf(*strip)];
         if (point.x < visible_region.left || point.x >= visible_region.right) {
             return std::nullopt;
         }
@@ -1078,7 +966,7 @@ struct TerminalPage::Impl {
                 continue;
             }
             const std::size_t index = action->pane_index;
-            if (GroupOf(index) == GroupOf(source)) {
+            if (GroupOf(index) == GroupOf(*strip)) {
                 tabs.push_back(&element);
             }
         }
@@ -1090,6 +978,7 @@ struct TerminalPage::Impl {
         });
 
         TabInsertionTarget target{};
+        target.group = GroupOf(*strip);
         const detail::UiElement* edge = tabs.back();
         target.slot = ActionForId(edge->id)->pane_index + 1;
         target.x = edge->bounds.right;
@@ -1105,51 +994,59 @@ struct TerminalPage::Impl {
                 break;
             }
         }
-        if (DestinationForSlot(source, target.slot) == source) {
+        if (target.group == GroupOf(source) && DestinationForSlot(source, target.slot) == source) {
             return std::nullopt;
         }
         return target;
     }
 
-    SplitDropZone DropZoneAt(POINT point, int source_tab = -1) const noexcept {
-        const int effective_source = source_tab >= 0 ? source_tab : dragged_tab;
-        if (const auto tab_target = TabStripAt(point)) {
-            if (split_active && effective_source >= 0 &&
-                GroupOf(*tab_target) != GroupOf(static_cast<std::size_t>(effective_source))) {
-                return SplitDropZone::center;
-            }
-            return SplitDropZone::none;
-        }
+    SplitDropZone DropZoneAt(const POINT point, const int source_tab = -1) const noexcept {
+        const int source = source_tab >= 0 ? source_tab : dragged_tab;
+        if (const auto strip = TabStripAt(point))
+            return split_active && source >= 0 &&
+                           GroupOf(*strip) != GroupOf(static_cast<std::size_t>(source))
+                       ? SplitDropZone::center
+                       : SplitDropZone::none;
         const auto target = PaneAt(point);
-        if (!target) {
+        if (!target)
             return SplitDropZone::none;
-        }
-        const RECT& target_rect = pane_rects[*target];
-        const int left = point.x - target_rect.left;
-        const int right = target_rect.right - point.x;
-        return left <= right ? SplitDropZone::left : SplitDropZone::right;
+        if (split_active)
+            return source >= 0 && GroupOf(*target) != GroupOf(static_cast<std::size_t>(source))
+                       ? SplitDropZone::center
+                       : SplitDropZone::none;
+        const auto& rect = pane_rects[*target];
+        // 标签栏负责排序；离开标签栏后，内容区左右两侧都可分屏。
+        // 不再把落点压缩到外缘 96 DIP，仅在中心留少量取消区防止误放。
+        const LONG midpoint = rect.left + (rect.right - rect.left) / 2;
+        const int center_gap =
+            std::min(detail::ScaleForDpi(12, detail::WindowDpi(hwnd)),
+                     std::max(1, static_cast<int>((rect.right - rect.left) / 20)));
+        if (point.x < midpoint - center_gap)
+            return SplitDropZone::left;
+        if (point.x >= midpoint + center_gap)
+            return SplitDropZone::right;
+        return SplitDropZone::none;
     }
 
     RECT DropZoneRect() const noexcept {
-        RECT result = visible_drop_pane && *visible_drop_pane < pane_rects.size()
-                          ? pane_rects[*visible_drop_pane]
-                          : pane_area;
-        switch (visible_drop_zone) {
-        case SplitDropZone::left:
-            result.right = result.left + (result.right - result.left) / 2;
-            break;
-        case SplitDropZone::right:
-            result.left = result.left + (result.right - result.left) / 2;
-            break;
-        case SplitDropZone::center:
-            result.bottom = std::min(result.bottom,
-                                     result.top + detail::ScaleForDpi(40, detail::WindowDpi(hwnd)));
-            break;
-        case SplitDropZone::none:
-            result = {};
-            break;
-        }
-        return result;
+        if (!visible_drop_pane || *visible_drop_pane >= pane_rects.size())
+            return {};
+        RECT rect = pane_rects[*visible_drop_pane];
+        const UINT dpi = detail::WindowDpi(hwnd);
+        const int inset = detail::ScaleForDpi(5, dpi),
+                  line = std::max(1, detail::ScaleForDpi(2, dpi));
+        rect.bottom = std::min(rect.bottom, rect.top + detail::ScaleForDpi(34, dpi));
+        if (visible_drop_zone == SplitDropZone::left)
+            return {
+                rect.left + inset, rect.top + inset, rect.left + inset + line, rect.bottom - inset};
+        if (visible_drop_zone == SplitDropZone::right)
+            return {rect.right - inset - line,
+                    rect.top + inset,
+                    rect.right - inset,
+                    rect.bottom - inset};
+        if (visible_drop_zone == SplitDropZone::center)
+            return {rect.left + inset, rect.bottom - line, rect.right - inset, rect.bottom};
+        return {};
     }
 
     void HandleTabDrop(std::size_t index, POINT point) {
@@ -1157,14 +1054,16 @@ struct TerminalPage::Impl {
             return;
         }
         if (const auto insertion = TabInsertionAt(point, index)) {
-            ReorderTab(index, insertion->slot);
+            ReorderTab(index, insertion->slot, insertion->group);
             return;
         }
         const SplitDropZone zone = DropZoneAt(point, static_cast<int>(index));
         if (zone == SplitDropZone::none) {
             return;
         }
-        const auto target = zone == SplitDropZone::center ? TabStripAt(point) : PaneAt(point);
+        auto target = TabStripAt(point);
+        if (!target)
+            target = PaneAt(point);
         if (zone == SplitDropZone::center) {
             if (split_active && target) {
                 const unsigned target_group = GroupOf(*target);
@@ -1236,12 +1135,15 @@ struct TerminalPage::Impl {
         }
     }
 
-    void ReorderTab(const std::size_t source, const std::size_t slot) {
+    void ReorderTab(const std::size_t source,
+                    const std::size_t slot,
+                    const std::optional<unsigned> target_group = std::nullopt) {
         if (source >= panes.size() || slot > panes.size()) {
             return;
         }
         const std::size_t destination = DestinationForSlot(source, slot);
-        if (destination == source || destination >= panes.size()) {
+        if ((destination == source && (!target_group || *target_group == GroupOf(source))) ||
+            destination >= panes.size()) {
             return;
         }
 
@@ -1253,6 +1155,8 @@ struct TerminalPage::Impl {
             }
         }
         TerminalControl* moved = panes[source].get();
+        if (target_group)
+            pane_groups[source] = *target_group;
         MoveItem(panes, source, destination);
         MoveItem(pane_titles, source, destination);
         MoveItem(pane_view_states, source, destination);
@@ -1313,10 +1217,18 @@ struct TerminalPage::Impl {
             return false;
         }
         HWND encoding_selector = CreateWindowExW(
-            0, selector::kClassName, L"", WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS,
-            0, 0, 0, 0, hwnd,
+            0,
+            selector::kClassName,
+            L"",
+            WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS,
+            0,
+            0,
+            0,
+            0,
+            hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(next_native_control_id + 1)),
-            instance, nullptr);
+            instance,
+            nullptr);
         if (!encoding_selector) {
             return false;
         }
@@ -1421,8 +1333,7 @@ struct TerminalPage::Impl {
             }
             SetPaneEncoding(pane_index, terminal::TerminalEncoding::Utf8);
         }
-        pane_view_states[pane_index] =
-            {ViewPhase::Connecting, {}, ViewRecoveryAction::None};
+        pane_view_states[pane_index] = {ViewPhase::Connecting, {}, ViewRecoveryAction::None};
         server_activated(server_ids[server_index], pane_index);
         Focus(pane_index);
         return true;
@@ -1570,13 +1481,10 @@ struct TerminalPage::Impl {
                 .role = detail::UiRole::file_tab,
                 .bounds = detail::UiRect(left, top + inset, right, tab_bottom),
                 .text = pane_titles[index] +
-                        (pane_view_states[index].phase == ViewPhase::Connecting
-                             ? L" · 连接中"
-                         : pane_view_states[index].phase == ViewPhase::Disconnected
-                             ? L" · 已断开"
-                         : pane_view_states[index].phase == ViewPhase::Error
-                             ? L" · 连接失败"
-                             : L""),
+                        (pane_view_states[index].phase == ViewPhase::Connecting     ? L" · 连接中"
+                         : pane_view_states[index].phase == ViewPhase::Disconnected ? L" · 已断开"
+                         : pane_view_states[index].phase == ViewPhase::Error        ? L" · 连接失败"
+                                                                                    : L""),
                 .icon = detail::UiIcon::terminal,
                 .alignment = detail::UiTextAlign::leading,
                 .selected = selected,
@@ -1618,14 +1526,13 @@ struct TerminalPage::Impl {
             const float button_gap = std::min(2.0F * scale, usable_width / 16.0F);
             const float arrow_pair_width = 2.0F * button_width + button_gap;
             const int inner_width = std::max(1, static_cast<int>(usable_width));
-            auto viewport = ComputeTerminalTabViewport(
-                inner_width,
-                detail::ScaleForDpi(78, dpi),
-                detail::ScaleForDpi(147, dpi),
-                detail::ScaleForDpi(2, dpi),
-                static_cast<int>(arrow_pair_width),
-                tabs.size(),
-                tab_scroll_first[group_id]);
+            auto viewport = ComputeTerminalTabViewport(inner_width,
+                                                       detail::ScaleForDpi(78, dpi),
+                                                       detail::ScaleForDpi(147, dpi),
+                                                       detail::ScaleForDpi(2, dpi),
+                                                       static_cast<int>(arrow_pair_width),
+                                                       tabs.size(),
+                                                       tab_scroll_first[group_id]);
             if (TerminalControl* target = reveal_tab[group_id]) {
                 const auto found = std::ranges::find_if(tabs, [this, target](std::size_t index) {
                     return panes[index].get() == target;
@@ -1640,12 +1547,13 @@ struct TerminalPage::Impl {
             tab_visible_counts[group_id] = viewport.count;
             const float tab_right_edge =
                 right - margin - (viewport.overflow ? arrow_pair_width : 0.0F);
-            tab_visible_regions[group_id] = {
-                static_cast<LONG>(left + margin), static_cast<LONG>(top),
-                static_cast<LONG>(tab_right_edge), static_cast<LONG>(top + strip_height)};
+            tab_visible_regions[group_id] = {static_cast<LONG>(left + margin),
+                                             static_cast<LONG>(top),
+                                             static_cast<LONG>(tab_right_edge),
+                                             static_cast<LONG>(top + strip_height)};
             float tab_left = left + margin;
-            for (std::size_t ordinal = viewport.first;
-                 ordinal < viewport.first + viewport.count; ++ordinal) {
+            for (std::size_t ordinal = viewport.first; ordinal < viewport.first + viewport.count;
+                 ++ordinal) {
                 const std::size_t index = tabs[ordinal];
                 if (index >= panes.size() || tab_left >= tab_right_edge) {
                     break;
@@ -1656,22 +1564,26 @@ struct TerminalPage::Impl {
             }
             if (viewport.overflow) {
                 const float arrows_left = right - margin - arrow_pair_width;
-                const auto add_arrow = [&](TabHitKind kind, float arrow_left, bool enabled,
-                                           detail::UiIcon icon) {
-                    surface.Add({
-                        .id = AddTabAction({0, kind, 0, group_id}),
-                        .role = detail::UiRole::icon_button,
-                        .bounds = detail::UiRect(arrow_left, top + 5.0F * scale,
-                                                 arrow_left + button_width,
-                                                 top + strip_height - 5.0F * scale),
-                        .icon = icon,
-                        .alignment = detail::UiTextAlign::center,
-                        .enabled = enabled,
-                    });
-                };
-                add_arrow(TabHitKind::scroll_left, arrows_left, viewport.first > 0,
+                const auto add_arrow =
+                    [&](TabHitKind kind, float arrow_left, bool enabled, detail::UiIcon icon) {
+                        surface.Add({
+                            .id = AddTabAction({0, kind, 0, group_id}),
+                            .role = detail::UiRole::icon_button,
+                            .bounds = detail::UiRect(arrow_left,
+                                                     top + 5.0F * scale,
+                                                     arrow_left + button_width,
+                                                     top + strip_height - 5.0F * scale),
+                            .icon = icon,
+                            .alignment = detail::UiTextAlign::center,
+                            .enabled = enabled,
+                        });
+                    };
+                add_arrow(TabHitKind::scroll_left,
+                          arrows_left,
+                          viewport.first > 0,
                           detail::UiIcon::chevron_left);
-                add_arrow(TabHitKind::scroll_right, arrows_left + button_width + button_gap,
+                add_arrow(TabHitKind::scroll_right,
+                          arrows_left + button_width + button_gap,
                           viewport.first + viewport.count < tabs.size(),
                           detail::UiIcon::chevron);
             }
@@ -1714,13 +1626,11 @@ struct TerminalPage::Impl {
         if (visible_drop_zone != SplitDropZone::none) {
             const RECT drop = DropZoneRect();
             surface.Add({
-                .role = detail::UiRole::drop_target,
-                .bounds = detail::UiRect(static_cast<float>(drop.left + 8),
-                                         static_cast<float>(drop.top + 8),
-                                         static_cast<float>(drop.right - 8),
-                                         static_cast<float>(drop.bottom - 8)),
-                .text = visible_drop_zone == SplitDropZone::center ? L"" : L"拖放到此处分屏",
-                .alignment = detail::UiTextAlign::center,
+                .role = detail::UiRole::separator,
+                .bounds = detail::UiRect(static_cast<float>(drop.left),
+                                         static_cast<float>(drop.top),
+                                         static_cast<float>(drop.right),
+                                         static_cast<float>(drop.bottom)),
             });
         }
         if (visible_tab_insertion) {
@@ -1749,9 +1659,8 @@ struct TerminalPage::Impl {
             surface.SetOverlayAccent(std::nullopt);
             return;
         }
-        const int tab_id = active_pane < pane_tab_element_ids.size()
-                               ? pane_tab_element_ids[active_pane]
-                               : 0;
+        const int tab_id =
+            active_pane < pane_tab_element_ids.size() ? pane_tab_element_ids[active_pane] : 0;
         if (tab_id == 0) {
             surface.SetOverlayAccent(std::nullopt);
             return;
@@ -1793,9 +1702,9 @@ struct TerminalPage::Impl {
             KillTimer(hwnd, kTabMotionTimerId);
             return;
         }
-        const float fraction = std::min(1.0F, static_cast<float>(GetTickCount64() -
-                                                                tab_motion_start) /
-                                                      static_cast<float>(kTabMotionDurationMs));
+        const float fraction = std::min(1.0F,
+                                        static_cast<float>(GetTickCount64() - tab_motion_start) /
+                                            static_cast<float>(kTabMotionDurationMs));
         tab_motion_progress = 1.0F - (1.0F - fraction) * (1.0F - fraction);
         tab_motion_active = fraction < 1.0F;
         if (!tab_motion_active) {
@@ -2008,10 +1917,18 @@ bool TerminalPage::Create(HWND parent, HINSTANCE instance) {
         SetLayeredWindowAttributes(
             impl_->resize_guide, kResizeGuideTransparentColor, 0, LWA_COLORKEY);
     }
-    impl_->tab_tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
-                                         WS_POPUP | TTS_ALWAYSTIP, CW_USEDEFAULT,
-                                         CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-                                         impl_->hwnd, nullptr, instance, nullptr);
+    impl_->tab_tooltip = CreateWindowExW(WS_EX_TOPMOST,
+                                         TOOLTIPS_CLASSW,
+                                         nullptr,
+                                         WS_POPUP | TTS_ALWAYSTIP,
+                                         CW_USEDEFAULT,
+                                         CW_USEDEFAULT,
+                                         CW_USEDEFAULT,
+                                         CW_USEDEFAULT,
+                                         impl_->hwnd,
+                                         nullptr,
+                                         instance,
+                                         nullptr);
     if (impl_->tab_tooltip) {
         TOOLINFOW tool{sizeof(tool)};
         tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS | TTF_TRANSPARENT;
@@ -2019,7 +1936,9 @@ bool TerminalPage::Create(HWND parent, HINSTANCE instance) {
         tool.uId = reinterpret_cast<UINT_PTR>(impl_->hwnd);
         tool.lpszText = LPSTR_TEXTCALLBACKW;
         SendMessageW(impl_->tab_tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
-        SendMessageW(impl_->tab_tooltip, TTM_SETMAXTIPWIDTH, 0,
+        SendMessageW(impl_->tab_tooltip,
+                     TTM_SETMAXTIPWIDTH,
+                     0,
                      detail::ScaleForDpi(480, detail::WindowDpi(impl_->hwnd)));
     }
     impl_->BuildPanes();
@@ -2033,6 +1952,8 @@ void TerminalPage::SetBounds(int x, int y, int width, int height) {
 
 void TerminalPage::Show(bool visible) {
     if (!visible) {
+        impl_->CancelDrag();
+        impl_->surface.CancelPointer();
         for (const auto& pane : impl_->panes) {
             pane->Show(false);
         }

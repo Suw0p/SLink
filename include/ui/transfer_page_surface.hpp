@@ -47,7 +47,6 @@ struct TransferSurfaceLayout {
     std::vector<TransferSurfaceGroup> groups;
     std::optional<RECT> split_separator;
     std::optional<RECT> drop_zone;
-    bool drop_center{};
     std::optional<TransferTabInsertion> insertion;
 };
 
