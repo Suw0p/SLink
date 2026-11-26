@@ -199,6 +199,33 @@ struct MainWindow::Impl {
         }
 
         switch (message) {
+        case WM_NCCALCSIZE: {
+            // 主窗口的顶栏和边缘都由 surface 绘制。保留 WS_THICKFRAME 供系统缩放/
+            // 贴靠使用，但不能再给默认非客户区预留一圈没有被自绘覆盖的浅色外框。
+            auto* client = wparam ? &reinterpret_cast<NCCALCSIZE_PARAMS*>(lparam)->rgrc[0]
+                                  : reinterpret_cast<RECT*>(lparam);
+            if (client && IsZoomed(window)) {
+                MONITORINFO monitor{sizeof(monitor)};
+                if (GetMonitorInfoW(MonitorFromRect(client, MONITOR_DEFAULTTONEAREST), &monitor)) {
+                    client->left = std::max(client->left, monitor.rcWork.left);
+                    client->top = std::max(client->top, monitor.rcWork.top);
+                    client->right = std::min(client->right, monitor.rcWork.right);
+                    client->bottom = std::min(client->bottom, monitor.rcWork.bottom);
+                }
+            }
+            return 0;
+        }
+        case WM_NCACTIVATE:
+            if (!IsIconic(window)) {
+                // 弹窗禁用/激活 owner 时，默认处理仍会按 WS_THICKFRAME 重画系统边框。
+                // 保留系统激活状态更新，但用 -1 禁止覆盖已自绘的窗口边缘。
+                return DefWindowProcW(window, message, wparam, -1);
+            }
+            break;
+        case WM_NCPAINT:
+            if (!IsIconic(window))
+                return 0; // 全窗口已是客户区；普通及失活边框都由 surface 负责。
+            break;
         case kUiTaskMessage:
             self->DrainUiTasks();
             return 0;
@@ -408,10 +435,10 @@ struct MainWindow::Impl {
                 } catch (...) {
                     self->close_pending = false;
                     EnableWindow(window, TRUE);
-                    MessageBoxW(window,
-                                L"无法保存退出快照，窗口已保留，请重试。",
-                                L"SLink",
-                                MB_OK | MB_ICONERROR);
+                    ::SLink::ui::ShowMessageDialog(window,
+                                                   L"无法保存退出快照，窗口已保留，请重试。",
+                                                   L"SLink",
+                                                   MB_OK | MB_ICONERROR);
                 }
                 return 0;
             }
@@ -527,7 +554,8 @@ struct MainWindow::Impl {
             try {
                 callback();
             } catch (...) {
-                MessageBoxW(hwnd, L"后台任务的界面回调执行失败。", L"SLink", MB_OK | MB_ICONERROR);
+                ::SLink::ui::ShowMessageDialog(
+                    hwnd, L"后台任务的界面回调执行失败。", L"SLink", MB_OK | MB_ICONERROR);
             }
         }
     }
@@ -989,7 +1017,8 @@ struct MainWindow::Impl {
             try {
                 server_manager_callback();
             } catch (...) {
-                MessageBoxW(hwnd, L"无法打开服务器管理界面。", L"SLink", MB_OK | MB_ICONERROR);
+                ::SLink::ui::ShowMessageDialog(
+                    hwnd, L"无法打开服务器管理界面。", L"SLink", MB_OK | MB_ICONERROR);
             }
             return;
         }
@@ -1034,6 +1063,24 @@ struct MainWindow::Impl {
         transfer->ApplyTheme();
         editor->ApplyTheme();
         port_forward->ApplyTheme();
+        // 改动快照等是拥有者窗口而非子窗口，EnumChildWindows 不会覆盖它们。
+        EnumThreadWindows(
+            GetCurrentThreadId(),
+            +[](HWND window, LPARAM owner) -> BOOL {
+                if (window == reinterpret_cast<HWND>(owner) ||
+                    GetAncestor(window, GA_ROOTOWNER) != reinterpret_cast<HWND>(owner))
+                    return TRUE;
+                wchar_t name[128]{};
+                GetClassNameW(window, name, 128);
+                if (std::wstring_view(name).starts_with(L"SLink.")) {
+                    detail::ApplyPopupWindowTheme(window);
+                    SendMessageW(window, WM_THEMECHANGED, 0, 0);
+                    RedrawWindow(
+                        window, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
+                }
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(hwnd));
         CommitLayoutNow();
         RedrawWindow(hwnd,
                      nullptr,
@@ -1599,6 +1646,14 @@ bool MainWindow::Create(HINSTANCE instance, int show_command) {
         return false;
     }
     detail::EnableDarkTitleBar(impl_->hwnd);
+    // 在首次显示前重新计算无标题栏客户区，不能等用户调整窗口后才移除默认外框。
+    SetWindowPos(impl_->hwnd,
+                 nullptr,
+                 0,
+                 0,
+                 0,
+                 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     ShowWindow(impl_->hwnd, show_command);
     UpdateWindow(impl_->hwnd);
     return true;

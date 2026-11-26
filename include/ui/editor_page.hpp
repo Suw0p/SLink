@@ -160,6 +160,7 @@ public:
     [[nodiscard]] std::optional<EditorSaveRequest> DocumentSnapshot(EditorDocumentId id);
     [[nodiscard]] bool DocumentSaving(EditorDocumentId id) const noexcept;
     [[nodiscard]] bool DocumentDirty(EditorDocumentId id) const noexcept;
+    void SetDocumentDirty(EditorDocumentId id, bool dirty);
     [[nodiscard]] std::optional<EditorDocumentId> active_document() const noexcept;
     [[nodiscard]] std::size_t document_count() const noexcept;
 
@@ -171,6 +172,12 @@ public:
     void SetOverwriteRequestedCallback(SaveRequestCallback callback);
     void SetSaveAsRequestedCallback(SaveRequestCallback callback);
     void SetDiffRequestedCallback(DocumentActionCallback callback);
+    void SetChangesRequestedCallback(DocumentActionCallback callback);
+    void RequestChanges();
+    // 独立只读快照窗口，不切换当前 Scintilla 文档或破坏其撤销历史。
+    HWND ShowChangesView(std::wstring title, std::string report);
+    // 与编辑区底部一致的稳定文档身份，不依赖侧栏当前选择，也不暴露 URI/目录路径。
+    std::wstring DocumentDisplayName(EditorDocumentId id) const;
     void SetCloseRequestedCallback(CloseRequestCallback callback);
     void SetDocumentChangedCallback(DocumentChangedCallback callback);
     void SetActiveDocumentChangedCallback(ActiveDocumentChangedCallback callback);

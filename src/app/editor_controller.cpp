@@ -1,6 +1,8 @@
 // 远程编辑协调器实现：按服务器串行、跨服务器并行执行文档操作，再把结果投递回 UI。
 #include "app/editor_controller.hpp"
 #include "app/editor_work_scheduler.hpp"
+#include "editor/gb2312_codec.hpp"
+#include "ui/file_operation_dialogs.hpp"
 
 #ifndef _WIN32
 #error EditorController is a Windows-only implementation
@@ -13,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <commctrl.h>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -212,6 +215,8 @@ struct EditorController::Impl {
         std::shared_ptr<DocumentState> state;
         std::optional<ui::EditorSaveRequest> snapshot;
         bool completed{}; // 由 state->mutex 保护，任务取消后仍由退出协调器接管。
+        CloseDecision decision{CloseDecision::KeepDraft};
+        bool saved{}, save_conflict{};
     };
 
     ui::EditorPage& page;
@@ -383,6 +388,9 @@ struct EditorController::Impl {
         page.SetDiffRequestedCallback([this](ui::EditorDocumentId id) {
             OnDiff(id);
         });
+        page.SetChangesRequestedCallback([this](ui::EditorDocumentId id) {
+            OnChanges(id);
+        });
         page.SetCloseRequestedCallback([this](ui::EditorDocumentId id, bool dirty) {
             OnClose(id, dirty);
         });
@@ -398,6 +406,7 @@ struct EditorController::Impl {
         page.SetOverwriteRequestedCallback({});
         page.SetSaveAsRequestedCallback({});
         page.SetDiffRequestedCallback({});
+        page.SetChangesRequestedCallback({});
         page.SetCloseRequestedCallback({});
         page.SetDocumentChangedCallback({});
     }
@@ -456,7 +465,7 @@ struct EditorController::Impl {
             return;
         }
         const auto text = OperationMessage(operation, message);
-        MessageBoxW(page.hwnd(), text.c_str(), L"SLink", MB_OK | MB_ICONERROR);
+        ::SLink::ui::ShowMessageDialog(page.hwnd(), text.c_str(), L"SLink", MB_OK | MB_ICONERROR);
     }
 
     void ReportErrorAsync(std::wstring operation, std::string message) {
@@ -522,11 +531,12 @@ struct EditorController::Impl {
             const bool discard_local_changes =
                 state->second->ui_dirty.load(std::memory_order_acquire);
             if (discard_local_changes &&
-                MessageBoxW(page.hwnd(),
-                            L"此文件有未保存的本地修改。重新读取远端文件会丢弃这些修改，"
-                            L"且不会上传或覆盖远端文件。\r\n\r\n确定丢弃本地修改并重新打开吗？",
-                            L"重新打开文件",
-                            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                ::SLink::ui::ShowMessageDialog(
+                    page.hwnd(),
+                    L"此文件有未保存的本地修改。重新读取远端文件会丢弃这些修改，"
+                    L"且不会上传或覆盖远端文件。\r\n\r\n确定丢弃本地修改并重新打开吗？",
+                    L"重新打开文件",
+                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
                 return;
             }
             auto previous = state->second;
@@ -739,11 +749,12 @@ struct EditorController::Impl {
 
     void OnDocumentChanged(ui::EditorDocumentId id) {
         const auto found = documents.find(id);
-        if (found == documents.end() || found->second->closing.load(std::memory_order_acquire)) {
+        if (found == documents.end() || found->second->closing.load(std::memory_order_acquire) ||
+            preparing_shutdown) {
             return;
         }
         auto state = found->second;
-        state->ui_dirty.store(true, std::memory_order_release);
+        state->ui_dirty.store(page.DocumentDirty(id), std::memory_order_release);
         const auto generation = state->edit_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
         scheduler->EnqueueLatest(
             state->lane,
@@ -772,15 +783,27 @@ struct EditorController::Impl {
                                 return;
                             }
                             editor::EditorStatus status;
+                            bool dirty = true;
                             {
                                 std::scoped_lock lock(state->mutex);
                                 if (!state->document) {
                                     return;
                                 }
                                 status = state->document->UpdateText(std::move(text));
+                                dirty = state->document->dirty();
                             }
                             if (!status) {
                                 ReportErrorAsync(L"保存编辑器恢复缓存", status.message);
+                            } else {
+                                PostToUi([this, state, generation, dirty] {
+                                    if (!IsCurrent(state) || state->closing.load() ||
+                                        state->edit_generation.load() != generation ||
+                                        preparing_shutdown)
+                                        return;
+                                    state->ui_dirty.store(dirty);
+                                    if (page.DocumentDirty(state->id) != dirty)
+                                        page.SetDocumentDirty(state->id, dirty);
+                                });
                             }
                         });
                 });
@@ -901,19 +924,29 @@ struct EditorController::Impl {
             return;
         }
         auto state = found->second;
-        state->edit_generation.fetch_add(1, std::memory_order_acq_rel);
+        const auto generation = state->edit_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
         state->ui_dirty.store(true, std::memory_order_release);
-        Enqueue(state->lane, [this, state, request = std::move(request)]() mutable {
+        Enqueue(state->lane, [this, state, generation, request = std::move(request)]() mutable {
             editor::EditorStatus status;
+            bool dirty = true;
             {
                 std::scoped_lock lock(state->mutex);
                 if (!state->document || state->closing.load(std::memory_order_acquire))
                     return;
                 status = state->document->UpdateText(std::move(request.content),
                                                      ToDocumentEncoding(request.encoding));
+                dirty = state->document->dirty();
             }
             if (!status)
                 ReportErrorAsync(L"切换文件编码", status.message);
+            else
+                PostToUi([this, state, generation, dirty] {
+                    if (!IsCurrent(state) || state->closing.load() ||
+                        state->edit_generation.load() != generation || preparing_shutdown)
+                        return;
+                    state->ui_dirty.store(dirty);
+                    page.SetDocumentDirty(state->id, dirty);
+                });
         });
     }
 
@@ -1086,6 +1119,215 @@ struct EditorController::Impl {
                 });
     }
 
+    static std::string ChangeReport(std::string original,
+                                    editor::TextEncoding original_encoding,
+                                    std::string current,
+                                    editor::TextEncoding current_encoding) {
+        const auto unicode = [](std::string& text, editor::TextEncoding encoding) {
+            if (encoding == editor::TextEncoding::Unknown8Bit) {
+                if (auto decoded = editor::DecodeGb2312(text))
+                    text = std::move(*decoded);
+                else
+                    text = WideToUtf8(Utf8ToWide(text));
+            }
+        };
+        unicode(original, original_encoding);
+        unicode(current, current_encoding);
+        constexpr std::size_t limit = 2U * 1024U * 1024U;
+        bool truncated = false;
+        const auto lines = [&](std::string_view text) {
+            auto size = std::min(text.size(), limit);
+            while (size < text.size() && size > 0 &&
+                   (static_cast<unsigned char>(text[size]) & 0xc0U) == 0x80U)
+                --size;
+            truncated |= size != text.size();
+            text = text.substr(0, size);
+            std::vector<std::string_view> result;
+            while (!text.empty() && result.size() < 100000) {
+                const auto end = text.find('\n');
+                auto line = text.substr(0, end);
+                if (!line.empty() && line.back() == '\r')
+                    line.remove_suffix(1);
+                result.push_back(line);
+                if (end == std::string_view::npos) {
+                    text = {};
+                    break;
+                }
+                text.remove_prefix(end + 1);
+            }
+            truncated |= !text.empty();
+            return result;
+        };
+        const auto before = lines(original), after = lines(current);
+        std::string output =
+            "原版本：上次打开/成功保存的内容\n当前版本：本次编辑快照（不会写入原文件）\n"
+            "- 原始行号 | 删除/修改前\n+ 当前行号 | 新增/修改后\n\n";
+        const auto encoding_name = [](editor::TextEncoding encoding) {
+            return encoding == editor::TextEncoding::Utf8      ? "UTF-8"
+                   : encoding == editor::TextEncoding::Utf8Bom ? "UTF-8 BOM"
+                   : encoding == editor::TextEncoding::Gb2312  ? "GB2312"
+                                                               : "原始 8 位";
+        };
+        output += std::string("编码：") + encoding_name(original_encoding) + " → " +
+                  encoding_name(current_encoding) + "\n\n";
+        // 先剥离公共首尾；空白行被改成一个字符时，后续正文绝不能被当成差异。
+        std::size_t prefix = 0, old_end = before.size(), new_end = after.size();
+        while (prefix < old_end && prefix < new_end && before[prefix] == after[prefix])
+            ++prefix;
+        while (old_end > prefix && new_end > prefix && before[old_end - 1] == after[new_end - 1]) {
+            --old_end;
+            --new_end;
+        }
+        const int old_count = static_cast<int>(old_end - prefix);
+        const int new_count = static_cast<int>(new_end - prefix);
+        std::vector<char> edits;
+        // Myers 最短编辑路径不依赖“最近的空行”猜测。限制距离、比较次数和轨迹内存，
+        // 大面积重写时明确退化为中间差异块，而不是让 UI 等待无界 LCS。
+        constexpr int maximum_distance = 256;
+        constexpr std::size_t maximum_comparisons = 1000000;
+        const int distance_limit = std::min(maximum_distance, old_count + new_count);
+        const int offset = distance_limit + 1;
+        std::vector<int> furthest(static_cast<std::size_t>(distance_limit * 2 + 3), 0);
+        std::vector<std::vector<int>> trace;
+        std::size_t comparisons = 0;
+        int distance = -1;
+        if (std::abs(old_count - new_count) <= distance_limit) {
+            for (int d = 0; d <= distance_limit && comparisons < maximum_comparisons; ++d) {
+                trace.push_back(furthest);
+                for (int k = -d; k <= d && comparisons < maximum_comparisons; k += 2) {
+                    ++comparisons;
+                    int x =
+                        k == -d || (k != d && furthest[offset + k - 1] < furthest[offset + k + 1])
+                            ? furthest[offset + k + 1]
+                            : furthest[offset + k - 1] + 1;
+                    int y = x - k;
+                    while (x < old_count && y < new_count && comparisons < maximum_comparisons) {
+                        ++comparisons;
+                        if (before[prefix + x] != after[prefix + y])
+                            break;
+                        ++x;
+                        ++y;
+                    }
+                    furthest[offset + k] = x;
+                    if (x == old_count && y == new_count) {
+                        distance = d;
+                        break;
+                    }
+                }
+                if (distance >= 0)
+                    break;
+            }
+        }
+        if (distance >= 0) {
+            int x = old_count, y = new_count;
+            for (int d = distance; d >= 0; --d) {
+                const auto& previous = trace[d];
+                const int k = x - y;
+                const int previous_k =
+                    k == -d || (k != d && previous[offset + k - 1] < previous[offset + k + 1])
+                        ? k + 1
+                        : k - 1;
+                const int previous_x = previous[offset + previous_k];
+                const int previous_y = previous_x - previous_k;
+                while (x > previous_x && y > previous_y) {
+                    edits.push_back('=');
+                    --x;
+                    --y;
+                }
+                if (d > 0) {
+                    if (x == previous_x) {
+                        edits.push_back('+');
+                        --y;
+                    } else {
+                        edits.push_back('-');
+                        --x;
+                    }
+                }
+            }
+            std::reverse(edits.begin(), edits.end());
+        } else {
+            output += "[变更较大，以下按连续差异块显示；相同首尾已省略]\n";
+            edits.insert(edits.end(), old_count, '-');
+            edits.insert(edits.end(), new_count, '+');
+        }
+        const auto append = [&](char sign, std::size_t line, std::string_view value) {
+            if (output.size() + value.size() + 32 > limit) {
+                truncated = true;
+                return false;
+            }
+            output += sign;
+            output += " " + std::to_string(line + 1) + " | ";
+            output += value;
+            output += '\n';
+            return true;
+        };
+        const bool changed = old_count != 0 || new_count != 0;
+        std::size_t i = prefix, j = prefix;
+        bool in_hunk = false;
+        for (const char edit : edits) {
+            if (edit == '=') {
+                ++i;
+                ++j;
+                in_hunk = false;
+                continue;
+            }
+            if (!in_hunk) {
+                output += "@@ 原始行 " + std::to_string(i + 1) + " / 当前行 " +
+                          std::to_string(j + 1) + " @@\n";
+                in_hunk = true;
+            }
+            if (edit == '-') {
+                if (!append('-', i, before[i]))
+                    break;
+                ++i;
+            } else {
+                if (!append('+', j, after[j]))
+                    break;
+                ++j;
+            }
+        }
+        if (!changed)
+            output += original == current && original_encoding == current_encoding
+                          ? "没有内容差异。\n"
+                          : "文本行相同；编码或换行符有变化。\n";
+        if (truncated)
+            output += "\n[差异视图已按大小/行数上限截断，原文件和编辑内容不受影响]\n";
+        return output;
+    }
+
+    void OnChanges(ui::EditorDocumentId id) {
+        const auto found = documents.find(id);
+        if (found == documents.end() || found->second->closing.load() || preparing_shutdown)
+            return;
+        auto snapshot = page.DocumentSnapshot(id);
+        if (!snapshot)
+            return;
+        auto state = found->second;
+        Enqueue(state->lane, [this, state, snapshot = std::move(*snapshot)]() mutable {
+            auto original = [&] {
+                std::scoped_lock lock(state->mutex);
+                return state->document->OriginalText();
+            }();
+            if (!original) {
+                ReportErrorAsync(L"查看改动",
+                                 "此恢复草稿缺少原始快照，无法准确比较；现有内容保持不变。请勿把服"
+                                 "务器当前内容当作原版本。");
+                return;
+            }
+            auto report = ChangeReport(std::move(original.value().text),
+                                       original.value().encoding,
+                                       std::move(snapshot.content),
+                                       ToDocumentEncoding(snapshot.encoding));
+            PostToUi([this, state, report = std::move(report)]() mutable {
+                if (!IsCurrent(state) || state->closing.load() || preparing_shutdown)
+                    return;
+                if (!page.ShowChangesView(L"改动 · " + page.DocumentDisplayName(state->id),
+                                          std::move(report)))
+                    ReportError(L"查看改动", L"无法创建对比窗口，当前编辑内容保持不变。");
+            });
+        });
+    }
+
     void OnDiff(ui::EditorDocumentId id) {
         const auto found = documents.find(id);
         if (found == documents.end()) {
@@ -1117,7 +1359,8 @@ struct EditorController::Impl {
             message.append(L"\r\n远端字符数：");
             message.append(std::to_wstring(snapshot->remote_text.size()));
         }
-        MessageBoxW(page.hwnd(), message.c_str(), L"远端差异", MB_OK | MB_ICONINFORMATION);
+        ::SLink::ui::ShowMessageDialog(
+            page.hwnd(), message.c_str(), L"远端差异", MB_OK | MB_ICONINFORMATION);
     }
 
     static editor::EditorStatus CompleteClose(PendingClose& pending, bool close = true) try {
@@ -1125,6 +1368,11 @@ struct EditorController::Impl {
         if (pending.completed || !pending.state->document)
             return editor::EditorStatus::Ok();
         auto& document = *pending.state->document;
+        if (pending.decision == CloseDecision::Discard) {
+            auto status = document.DiscardChanges();
+            pending.completed = status.ok();
+            return status;
+        }
         if (pending.snapshot) {
             auto status = document.UpdateText(pending.snapshot->content,
                                               ToDocumentEncoding(pending.snapshot->encoding));
@@ -1133,6 +1381,17 @@ struct EditorController::Impl {
                 status = document.UpdateText(pending.snapshot->content);
             if (!status)
                 return status;
+        }
+        if (pending.decision == CloseDecision::Save) {
+            auto result = document.Save();
+            if (!result)
+                return result.status();
+            pending.state->conflict = result.value().conflict;
+            pending.save_conflict = result.value().outcome == editor::SaveOutcome::Conflict;
+            if (pending.save_conflict)
+                return editor::EditorStatus::Error(editor::EditorErrc::InvalidArgument,
+                                                   "Remote file changed; saving was cancelled");
+            pending.saved = true;
         }
         if (!close)
             return editor::EditorStatus::Ok();
@@ -1146,6 +1405,16 @@ struct EditorController::Impl {
                                            "Cannot preserve editor snapshot");
     }
 
+    CloseDecision ChooseClose(ui::EditorDocumentId id, const transfer::FileUri& uri) {
+        if (close_confirmation)
+            return close_confirmation(uri);
+        const auto choice = ui::ShowUnsavedFileDialog(page.hwnd(), page.DocumentDisplayName(id));
+        return choice == ui::UnsavedFileChoice::Save        ? CloseDecision::Save
+               : choice == ui::UnsavedFileChoice::Discard   ? CloseDecision::Discard
+               : choice == ui::UnsavedFileChoice::KeepDraft ? CloseDecision::KeepDraft
+                                                            : CloseDecision::Cancel;
+    }
+
     void OnClose(ui::EditorDocumentId id, bool dirty) {
         const auto found = documents.find(id);
         if (found == documents.end()) {
@@ -1155,27 +1424,16 @@ struct EditorController::Impl {
         auto state = found->second;
         if (state->closing.load(std::memory_order_acquire) || preparing_shutdown)
             return;
-        if (dirty) {
-            bool allow = false;
-            if (close_confirmation) {
-                allow = close_confirmation(state->uri);
-            } else {
-                allow = MessageBoxW(page.hwnd(),
-                                    L"未保存内容会保留在应用程序目录的恢复缓存中。"
-                                    L"\r\n是否关闭此标签？",
-                                    L"关闭远程文件",
-                                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
-            }
-            if (!allow) {
-                return;
-            }
-        }
+        const auto decision = dirty ? ChooseClose(state->id, state->uri) : CloseDecision::Discard;
+        if (decision == CloseDecision::Cancel)
+            return;
 
         auto pending = std::make_shared<PendingClose>();
         pending->state = state;
-        if (dirty)
+        pending->decision = decision;
+        if (dirty && decision != CloseDecision::Discard)
             pending->snapshot = page.DocumentSnapshot(id);
-        if (dirty && !pending->snapshot) {
+        if (dirty && decision != CloseDecision::Discard && !pending->snapshot) {
             ReportError(L"保留未保存内容", L"无法读取正文快照，标签已保留。");
             return;
         }
@@ -1185,6 +1443,8 @@ struct EditorController::Impl {
         scheduler->CancelLatest("checkpoint:" + std::to_string(id));
         // 不先撤掉唯一的可见正文。临时只读保证提交快照与最终移除的是同一版本。
         page.SetDocumentClosing(id, true);
+        if (decision == CloseDecision::Save)
+            page.SetDocumentSaving(id, true);
 
         Enqueue(state->lane, [this, pending] {
             const auto status = CompleteClose(*pending);
@@ -1197,8 +1457,13 @@ struct EditorController::Impl {
                     page.CloseDocument(state->id);
                 } else {
                     state->closing.store(false, std::memory_order_release);
+                    page.SetDocumentSaving(state->id, false);
                     page.SetDocumentClosing(state->id, false);
-                    ReportError(L"保留未保存内容", Utf8ToWide(status.message));
+                    if (pending->save_conflict)
+                        page.SetDocumentConflict(
+                            state->id, L"远端文件已变化；关闭已取消，请查看差异、覆盖或另存为。");
+                    else
+                        ReportError(L"关闭文件失败，修改仍保留", Utf8ToWide(status.message));
                 }
             });
         });
@@ -1211,12 +1476,27 @@ struct EditorController::Impl {
         }
         preparing_shutdown = true;
         std::vector<std::shared_ptr<PendingClose>> snapshots;
-        for (const auto& [id, state] : documents) {
-            if (state->closing.load(std::memory_order_acquire))
+        // 模态确认期间仍会消费异步完成消息，不能持有 unordered_map 的迭代器。
+        std::vector<std::shared_ptr<DocumentState>> candidates;
+        for (const auto& [id, state] : documents)
+            candidates.push_back(state);
+        std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+            return a->id < b->id;
+        });
+        for (const auto& state : candidates) {
+            if (!IsCurrent(state) || state->closing.load(std::memory_order_acquire))
                 continue;
+            const auto id = state->id;
             auto item = std::make_shared<PendingClose>();
             item->state = state;
-            if (state->ui_dirty.load(std::memory_order_acquire)) {
+            const bool dirty = page.DocumentDirty(id);
+            item->decision = dirty ? ChooseClose(state->id, state->uri) : CloseDecision::Discard;
+            if (item->decision == CloseDecision::Cancel) {
+                preparing_shutdown = false;
+                completed(false);
+                return;
+            }
+            if (dirty && item->decision != CloseDecision::Discard) {
                 item->snapshot = page.DocumentSnapshot(id);
                 if (!item->snapshot) {
                     for (const auto& previous : snapshots)
@@ -1226,46 +1506,79 @@ struct EditorController::Impl {
                     completed(false);
                     return;
                 }
-                state->edit_generation.fetch_add(1, std::memory_order_acq_rel);
             }
             snapshots.push_back(std::move(item));
-            page.SetDocumentClosing(id, true);
         }
-        // control 队列是排他屏障：等已在执行的保存/关闭结束，再写恢复缓存。
-        // 不调用 Close，失败时全部正文、端点和缓存租约仍可供用户继续编辑。
+        // 所有选择确认后才冻结正文；取消任何一个确认都不提前删除其他文件草稿。
+        for (const auto& item : snapshots) {
+            item->state->edit_generation.fetch_add(1);
+            scheduler->CancelLatest("checkpoint:" + std::to_string(item->state->id));
+            page.SetDocumentClosing(item->state->id, true);
+        }
+        // 先完成保存/保留草稿；这些操作失败时不执行其它文件的“放弃”。
         auto closing_snapshots = pending_closes;
-        Enqueue(
-            "control",
-            [this,
-             snapshots = std::move(snapshots),
-             closing_snapshots = std::move(closing_snapshots),
-             completed = std::move(completed)] {
-                auto status = editor::EditorStatus::Ok();
-                try {
-                    for (const auto& item : snapshots) {
-                        const auto current = CompleteClose(*item, false);
-                        if (!current && status)
-                            status = current;
+        Enqueue("control",
+                [this,
+                 snapshots = std::move(snapshots),
+                 closing_snapshots = std::move(closing_snapshots),
+                 completed = std::move(completed)] {
+                    auto status = editor::EditorStatus::Ok();
+                    try {
+                        for (const auto& item : snapshots) {
+                            if (item->decision == CloseDecision::Discard)
+                                continue;
+                            const auto current = CompleteClose(*item, false);
+                            if (!current && status)
+                                status = current;
+                        }
+                        // 单标签关闭失败的 UI 回调可能尚未消费，不能因此放行退出。
+                        // 该标签仍有 readonly UI 快照；其缓存失败由下面的检查直接报告。
+                        for (const auto& item : closing_snapshots) {
+                            const auto current = CompleteClose(*item, false);
+                            if (!current && status)
+                                status = current;
+                        }
+                        if (status) {
+                            for (const auto& item : snapshots) {
+                                if (item->decision != CloseDecision::Discard)
+                                    continue;
+                                const auto current = CompleteClose(*item);
+                                if (!current) {
+                                    status = current;
+                                    break;
+                                }
+                            }
+                        }
+                    } catch (const std::exception& error) {
+                        status =
+                            editor::EditorStatus::Error(editor::EditorErrc::IoError, error.what());
                     }
-                    // 单标签关闭失败的 UI 回调可能尚未消费，不能因此放行退出。
-                    // 该标签仍有 readonly UI 快照；其缓存失败由下面的检查直接报告。
-                    for (const auto& item : closing_snapshots) {
-                        const auto current = CompleteClose(*item, false);
-                        if (!current && status)
-                            status = current;
-                    }
-                } catch (const std::exception& error) {
-                    status = editor::EditorStatus::Error(editor::EditorErrc::IoError, error.what());
-                }
-                PostToUi([this, snapshots, completed, status] {
-                    preparing_shutdown = false;
-                    for (const auto& item : snapshots)
-                        page.SetDocumentClosing(item->state->id, false);
-                    if (!status)
-                        ReportError(L"退出已取消：无法保留未保存内容", Utf8ToWide(status.message));
-                    completed(status.ok());
+                    PostToUi([this, snapshots, completed, status] {
+                        preparing_shutdown = false;
+                        for (const auto& item : snapshots) {
+                            const auto& state = item->state;
+                            if (item->completed) {
+                                state->closing.store(true);
+                                uri_index.erase(state->uri.to_string());
+                                documents.erase(state->id);
+                                page.CloseDocument(state->id);
+                            } else {
+                                if (item->saved) {
+                                    state->ui_dirty.store(false);
+                                    page.MarkDocumentSaved(state->id);
+                                }
+                                page.SetDocumentClosing(state->id, false);
+                                if (item->save_conflict)
+                                    page.SetDocumentConflict(
+                                        state->id,
+                                        L"远端文件已变化；退出已取消，请查看差异、覆盖或另存为。");
+                            }
+                        }
+                        if (!status)
+                            ReportError(L"退出已取消：文件操作未完成", Utf8ToWide(status.message));
+                        completed(status.ok());
+                    });
                 });
-            });
     }
 };
 

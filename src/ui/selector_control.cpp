@@ -216,6 +216,7 @@ void ShowPopup(State& state) {
     if (!state.popup) {
         return;
     }
+    detail::ApplyPopupWindowTheme(state.popup);
     ShowWindow(state.popup, SW_SHOWNOACTIVATE);
     UpdateWindow(state.popup);
     SetCapture(state.popup);

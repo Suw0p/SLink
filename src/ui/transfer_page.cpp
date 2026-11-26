@@ -2765,7 +2765,7 @@ struct TransferPage::Impl {
             const std::wstring prompt = L"确定删除选中的 " + std::to_wstring(selected.size()) +
                                         L" 个项目吗？\n目录将递归删除，此操作无法撤销。";
             if (!selected.empty() &&
-                MessageBoxW(
+                ::SLink::ui::ShowMessageDialog(
                     hwnd, prompt.c_str(), L"确认删除", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) ==
                     IDYES) {
                 RunMutation(

@@ -107,7 +107,7 @@ std::wstring WindowsErrorText(const wchar_t* context, DWORD error) {
 }
 
 void ShowStartupFailure(const std::wstring& detail) {
-    MessageBoxW(
+    ::SLink::ui::ShowMessageDialog(
         nullptr, detail.c_str(), L"SLink 无法启动", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
 }
 
@@ -380,7 +380,7 @@ private:
         if (!window_) {
             return std::nullopt;
         }
-        ui::detail::EnableDarkTitleBar(window_);
+        ui::detail::ApplyPopupWindowTheme(window_);
         HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
         HWND label = CreateWindowExW(0,
                                      L"STATIC",
@@ -808,7 +808,8 @@ struct Application::Impl {
         if (rejected != 0 && main_window) {
             const std::wstring message = L"有 " + std::to_wstring(rejected) +
                                          L" 条传输恢复记录无效，已安全移除；其他任务仍可继续。";
-            MessageBoxW(main_window->hwnd(), message.c_str(), L"传输恢复", MB_OK | MB_ICONWARNING);
+            ::SLink::ui::ShowMessageDialog(
+                main_window->hwnd(), message.c_str(), L"传输恢复", MB_OK | MB_ICONWARNING);
         }
     }
 
@@ -1070,20 +1071,20 @@ struct Application::Impl {
                                   Utf8ToWide(key.algorithm) + L"\r\nSHA-256 指纹：\r\n" +
                                   Utf8ToWide(key.sha256_fingerprint) +
                                   L"\r\n\r\n仅在你已经通过可信渠道核对指纹后选择“是”。";
-        return MessageBoxW(main_window->hwnd(),
-                           text.c_str(),
-                           L"确认 SSH 主机密钥",
-                           MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+        return ::SLink::ui::ShowMessageDialog(main_window->hwnd(),
+                                              text.c_str(),
+                                              L"确认 SSH 主机密钥",
+                                              MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
     }
 
     void ShowOperationError(std::wstring_view title, const Status& status) const {
         if (status.code() == ErrorCode::cancelled || !main_window) {
             return;
         }
-        MessageBoxW(main_window->hwnd(),
-                    status.message().c_str(),
-                    std::wstring(title).c_str(),
-                    MB_OK | MB_ICONERROR);
+        ::SLink::ui::ShowMessageDialog(main_window->hwnd(),
+                                       status.message().c_str(),
+                                       std::wstring(title).c_str(),
+                                       MB_OK | MB_ICONERROR);
     }
 
     using FileOpenCompletion =
@@ -1663,10 +1664,10 @@ struct Application::Impl {
         }
         auto stored_groups = repository->ListServerGroups();
         if (!stored_groups) {
-            MessageBoxW(main_window->hwnd(),
-                        stored_groups.status().message.c_str(),
-                        L"无法读取服务器分组",
-                        MB_OK | MB_ICONERROR);
+            ::SLink::ui::ShowMessageDialog(main_window->hwnd(),
+                                           stored_groups.status().message.c_str(),
+                                           L"无法读取服务器分组",
+                                           MB_OK | MB_ICONERROR);
             return;
         }
         const auto profiles = SortedProfiles();
@@ -1706,10 +1707,10 @@ struct Application::Impl {
         }
         auto profiles = repository->ListServerProfiles();
         if (!profiles) {
-            MessageBoxW(main_window ? main_window->hwnd() : nullptr,
-                        profiles.status().message.c_str(),
-                        L"无法重新加载服务器配置",
-                        MB_OK | MB_ICONERROR);
+            ::SLink::ui::ShowMessageDialog(main_window ? main_window->hwnd() : nullptr,
+                                           profiles.status().message.c_str(),
+                                           L"无法重新加载服务器配置",
+                                           MB_OK | MB_ICONERROR);
             return;
         }
         std::unordered_map<std::string, storage::ServerProfile> replacement;
@@ -1804,10 +1805,11 @@ struct Application::Impl {
 
     void ShowPortForwardStorageError(std::wstring_view action,
                                      const storage::StorageStatus& status) {
-        MessageBoxW(main_window ? main_window->hwnd() : nullptr,
-                    (std::wstring(action) + L"\r\n\r\n" + status.message).c_str(),
-                    L"端口转发配置",
-                    MB_OK | MB_ICONERROR);
+        ::SLink::ui::ShowMessageDialog(
+            main_window ? main_window->hwnd() : nullptr,
+            (std::wstring(action) + L"\r\n\r\n" + status.message).c_str(),
+            L"端口转发配置",
+            MB_OK | MB_ICONERROR);
     }
 
     static std::string PortForwardIdentity(std::string_view bind_address,
@@ -2149,10 +2151,11 @@ int Application::Run(HINSTANCE instance, int show_command) {
             const auto saved = application_state->repository->SetSetting(
                 "appearance_theme", mode == ui::theme::Mode::Light ? "light" : "dark");
             if (!saved) {
-                MessageBoxW(application_state->main_window->hwnd(),
-                            (L"无法保存主题设置。\r\n\r\n" + saved.message).c_str(),
-                            L"SLink",
-                            MB_OK | MB_ICONERROR);
+                ::SLink::ui::ShowMessageDialog(
+                    application_state->main_window->hwnd(),
+                    (L"无法保存主题设置。\r\n\r\n" + saved.message).c_str(),
+                    L"SLink",
+                    MB_OK | MB_ICONERROR);
                 return false;
             }
             return true;
@@ -2185,10 +2188,11 @@ int Application::Run(HINSTANCE instance, int show_command) {
             const auto saved = application_state->repository->SetSetting(
                 "server_sidebar_collapsed_groups", std::move(serialized));
             if (!saved) {
-                MessageBoxW(application_state->main_window->hwnd(),
-                            (L"无法保存服务器分组展开状态。\r\n\r\n" + saved.message).c_str(),
-                            L"SLink",
-                            MB_OK | MB_ICONERROR);
+                ::SLink::ui::ShowMessageDialog(
+                    application_state->main_window->hwnd(),
+                    (L"无法保存服务器分组展开状态。\r\n\r\n" + saved.message).c_str(),
+                    L"SLink",
+                    MB_OK | MB_ICONERROR);
             }
             return saved.ok();
         });
@@ -2202,10 +2206,11 @@ int Application::Run(HINSTANCE instance, int show_command) {
             const auto saved = application_state->repository->SetSetting(
                 "server_sidebar_ungrouped", ungrouped ? "true" : "false");
             if (!saved) {
-                MessageBoxW(application_state->main_window->hwnd(),
-                            (L"无法保存服务器列表显示设置。\r\n\r\n" + saved.message).c_str(),
-                            L"SLink",
-                            MB_OK | MB_ICONERROR);
+                ::SLink::ui::ShowMessageDialog(
+                    application_state->main_window->hwnd(),
+                    (L"无法保存服务器列表显示设置。\r\n\r\n" + saved.message).c_str(),
+                    L"SLink",
+                    MB_OK | MB_ICONERROR);
             }
             return saved.ok();
         });
@@ -2217,10 +2222,11 @@ int Application::Run(HINSTANCE instance, int show_command) {
             const auto saved = application_state->repository->SetSetting(
                 "editor_word_wrap", enabled ? "true" : "false");
             if (!saved)
-                MessageBoxW(application_state->main_window->hwnd(),
-                            (L"无法保存编辑器自动换行设置。\r\n\r\n" + saved.message).c_str(),
-                            L"SLink",
-                            MB_OK | MB_ICONERROR);
+                ::SLink::ui::ShowMessageDialog(
+                    application_state->main_window->hwnd(),
+                    (L"无法保存编辑器自动换行设置。\r\n\r\n" + saved.message).c_str(),
+                    L"SLink",
+                    MB_OK | MB_ICONERROR);
             return saved.ok();
         });
     impl_->ui_dispatcher =
@@ -2681,10 +2687,10 @@ int Application::Run(HINSTANCE instance, int show_command) {
                     snapshot.remote_missing     ? L"远端文件已被删除，无法生成文本差异。"
                     : snapshot.remote_too_large ? L"远端文件超过 20 MB，未载入差异内容。"
                                                 : L"远端文件是二进制内容，无法生成文本差异。";
-                MessageBoxW(application_state->main_window->hwnd(),
-                            message.c_str(),
-                            L"查看远端差异",
-                            MB_OK | MB_ICONINFORMATION);
+                ::SLink::ui::ShowMessageDialog(application_state->main_window->hwnd(),
+                                               message.c_str(),
+                                               L"查看远端差异",
+                                               MB_OK | MB_ICONINFORMATION);
                 return;
             }
 

@@ -1246,7 +1246,7 @@ struct TerminalControl::Impl {
         input_codec.SetEncoding(transport_encoding.load(std::memory_order_acquire));
         auto encoded = input_codec.EncodeText(text);
         if (!encoded) {
-            MessageBoxW(
+            ::SLink::ui::ShowMessageDialog(
                 hwnd, encoded.status().message().c_str(), L"终端字符集", MB_OK | MB_ICONWARNING);
             return false;
         }
@@ -1811,7 +1811,7 @@ struct TerminalControl::Impl {
         input_codec.SetEncoding(transport_encoding.load(std::memory_order_acquire));
         auto encoded = input_codec.EncodeText(normalized);
         if (!encoded) {
-            MessageBoxW(
+            ::SLink::ui::ShowMessageDialog(
                 hwnd, encoded.status().message().c_str(), L"终端字符集", MB_OK | MB_ICONWARNING);
             return;
         }
@@ -1832,11 +1832,12 @@ struct TerminalControl::Impl {
         if (osc52_callback) {
             approved = osc52_callback(event);
         } else {
-            approved = MessageBoxW(hwnd,
-                                   L"远程服务器请求写入 Windows 剪贴板。\r\n"
-                                   L"是否允许本次操作？",
-                                   L"SLink · OSC 52 安全确认",
-                                   MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+            approved =
+                ::SLink::ui::ShowMessageDialog(hwnd,
+                                               L"远程服务器请求写入 Windows 剪贴板。\r\n"
+                                               L"是否允许本次操作？",
+                                               L"SLink · OSC 52 安全确认",
+                                               MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
         }
         if (!approved) {
             return;

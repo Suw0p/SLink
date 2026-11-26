@@ -80,7 +80,7 @@ public:
         if (!window_)
             return std::nullopt;
 
-        detail::EnableDarkTitleBar(window_);
+        detail::ApplyPopupWindowTheme(window_);
         EnableWindow(owner_, FALSE);
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);

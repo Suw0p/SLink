@@ -23,7 +23,13 @@ public:
         std::function<std::optional<transfer::FileUri>(const ui::EditorFileActivation&)>;
     using SaveAsTargetResolver =
         std::function<std::optional<transfer::FileUri>(const transfer::FileUri&)>;
-    using CloseConfirmation = std::function<bool(const transfer::FileUri&)>;
+    enum class CloseDecision {
+        Save,
+        Discard,
+        KeepDraft,
+        Cancel
+    };
+    using CloseConfirmation = std::function<CloseDecision(const transfer::FileUri&)>;
     using DirectoryActivationCallback = std::function<void(const ui::EditorFileActivation&)>;
     using ConflictDiffCallback = std::function<void(
         ui::EditorDocumentId, const transfer::FileUri&, const editor::ConflictSnapshot&)>;
@@ -49,8 +55,8 @@ public:
     // 调用在 UI 线程返回；实际绑定按编辑工作队列顺序异步完成。
     void RebindEndpoint(std::string server_id, std::shared_ptr<transfer::IFileEndpoint> endpoint);
 
-    // 退出前异步提交最新 UI 快照。调用期间宿主应禁止新的编辑，回调始终在 UI 线程。
-    // false 表示缓存失败，必须保留窗口/控制器，允许用户重试或另存备份，不能直接析构。
+    // 退出前逐文件确认保存/放弃/保留草稿/取消，再异步执行。取消或操作失败返回 false，
+    // 必须保留窗口与控制器；确认全部完成后才允许宿主析构。回调始终在 UI 线程。
     void PrepareForShutdown(std::function<void(bool)> completed);
 
     // 除 EndpointResolver 在编辑工作线程执行外，下列 provider 均在 UI 线程调用。

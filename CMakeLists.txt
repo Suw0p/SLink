@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(SLink
-    VERSION 1.1.6
+    VERSION 1.1.7
     DESCRIPTION "SLink"
     LANGUAGES C CXX RC)
 

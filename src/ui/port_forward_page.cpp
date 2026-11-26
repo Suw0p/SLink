@@ -379,11 +379,12 @@ struct PortForwardPage::Impl {
         GetWindowTextW(target_edit, target_buffer.data(), static_cast<int>(target_buffer.size()));
         auto request = ParsePortForwardRequest(bind_buffer.data(), target_buffer.data());
         if (!request) {
-            MessageBoxW(hwnd,
-                        L"本机监听可填写：3000、127.0.0.1:3000 或 0.0.0.0:3000。\r\n"
-                        L"转发目标请填写服务器 IPv4 和端口，例如 10.0.0.20:8080。",
-                        L"端口转发地址无效",
-                        MB_OK | MB_ICONWARNING);
+            ::SLink::ui::ShowMessageDialog(
+                hwnd,
+                L"本机监听可填写：3000、127.0.0.1:3000 或 0.0.0.0:3000。\r\n"
+                L"转发目标请填写服务器 IPv4 和端口，例如 10.0.0.20:8080。",
+                L"端口转发地址无效",
+                MB_OK | MB_ICONWARNING);
             return;
         }
         if (start_requested)
@@ -779,7 +780,8 @@ void PortForwardPage::SetFirewallRuleState(std::string_view bind_address,
             found->firewall_open = enabled;
     }
     if (!succeeded && !message.empty()) {
-        MessageBoxW(impl_->hwnd, message.c_str(), L"Windows 防火墙", MB_OK | MB_ICONERROR);
+        ::SLink::ui::ShowMessageDialog(
+            impl_->hwnd, message.c_str(), L"Windows 防火墙", MB_OK | MB_ICONERROR);
     }
     RECT rect{};
     GetClientRect(impl_->hwnd, &rect);

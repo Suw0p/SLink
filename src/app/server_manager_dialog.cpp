@@ -241,7 +241,7 @@ void ShowStorageError(HWND owner,
         message += L"\r\n\r\n";
         message += status.message;
     }
-    MessageBoxW(owner, message.c_str(), L"SLink", MB_OK | MB_ICONERROR);
+    ::SLink::ui::ShowMessageDialog(owner, message.c_str(), L"SLink", MB_OK | MB_ICONERROR);
 }
 
 UINT WindowDpi(HWND window) {
@@ -284,17 +284,7 @@ void SetFont(HWND control, HFONT font) {
 }
 
 void EnableDarkWindow(HWND window) {
-    BOOL enabled = ui::theme::IsDark() ? TRUE : FALSE;
-    constexpr DWORD kUseImmersiveDarkMode = 20;
-    if (FAILED(DwmSetWindowAttribute(window, kUseImmersiveDarkMode, &enabled, sizeof(enabled)))) {
-        constexpr DWORD kLegacyUseImmersiveDarkMode = 19;
-        DwmSetWindowAttribute(window, kLegacyUseImmersiveDarkMode, &enabled, sizeof(enabled));
-    }
-    // Windows 11 otherwise keeps a light one-pixel DWM frame around these
-    // compact dialogs even though their caption and client area are dark.
-    constexpr DWORD kDwmBorderColor = 34;
-    const COLORREF border_color = kBorderColor;
-    (void)DwmSetWindowAttribute(window, kDwmBorderColor, &border_color, sizeof(border_color));
+    ui::detail::ApplyPopupWindowTheme(window);
 }
 
 void ApplyDarkControl(HWND control) {
@@ -452,11 +442,11 @@ void RunModalWindow(HWND window, HWND owner) {
 
 bool EnsureVaultUnlocked(HWND owner, storage::Vault* vault) {
     if (!vault || !storage::Vault::IsSupported()) {
-        MessageBoxW(owner,
-                    L"当前构建没有可用的加密凭据库，无法保存密码或私钥。\r\n"
-                    L"请使用包含 libsodium 的正式构建。",
-                    L"SLink",
-                    MB_OK | MB_ICONERROR);
+        ::SLink::ui::ShowMessageDialog(owner,
+                                       L"当前构建没有可用的加密凭据库，无法保存密码或私钥。\r\n"
+                                       L"请使用包含 libsodium 的正式构建。",
+                                       L"SLink",
+                                       MB_OK | MB_ICONERROR);
         return false;
     }
     if (vault->is_unlocked()) {
@@ -687,22 +677,25 @@ bool ValidateAndCloseProfileEditor(HWND window, ProfileEditorState& state) {
     auto initial_directory = WideToUtf8(WindowText(state.initial_directory));
     const std::wstring port_text = WindowText(state.port);
     if (!name || name->empty()) {
-        MessageBoxW(window, L"请输入服务器名称。", L"SLink", MB_OK | MB_ICONWARNING);
+        ::SLink::ui::ShowMessageDialog(
+            window, L"请输入服务器名称。", L"SLink", MB_OK | MB_ICONWARNING);
         SetFocus(state.name);
         return false;
     }
     if (!host || host->empty()) {
-        MessageBoxW(window, L"请输入服务器地址。", L"SLink", MB_OK | MB_ICONWARNING);
+        ::SLink::ui::ShowMessageDialog(
+            window, L"请输入服务器地址。", L"SLink", MB_OK | MB_ICONWARNING);
         SetFocus(state.host);
         return false;
     }
     if (!username || username->empty()) {
-        MessageBoxW(window, L"请输入用户名。", L"SLink", MB_OK | MB_ICONWARNING);
+        ::SLink::ui::ShowMessageDialog(window, L"请输入用户名。", L"SLink", MB_OK | MB_ICONWARNING);
         SetFocus(state.username);
         return false;
     }
     if (!initial_directory) {
-        MessageBoxW(window, L"初始目录包含无效字符。", L"SLink", MB_OK | MB_ICONWARNING);
+        ::SLink::ui::ShowMessageDialog(
+            window, L"初始目录包含无效字符。", L"SLink", MB_OK | MB_ICONWARNING);
         SetFocus(state.initial_directory);
         return false;
     }
@@ -710,7 +703,8 @@ bool ValidateAndCloseProfileEditor(HWND window, ProfileEditorState& state) {
     const unsigned long parsed_port = std::wcstoul(port_text.c_str(), &port_end, 10);
     if (port_text.empty() || !port_end || *port_end != L'\0' || parsed_port == 0 ||
         parsed_port > 65535UL) {
-        MessageBoxW(window, L"端口必须是 1–65535 之间的数字。", L"SLink", MB_OK | MB_ICONWARNING);
+        ::SLink::ui::ShowMessageDialog(
+            window, L"端口必须是 1–65535 之间的数字。", L"SLink", MB_OK | MB_ICONWARNING);
         SetFocus(state.port);
         return false;
     }
@@ -724,7 +718,8 @@ bool ValidateAndCloseProfileEditor(HWND window, ProfileEditorState& state) {
     output.profile.port = static_cast<std::uint16_t>(parsed_port);
     const auto group_selection = static_cast<int>(SendMessageW(state.group, CB_GETCURSEL, 0, 0));
     if (group_selection < 0 || static_cast<std::size_t>(group_selection) > state.groups.size()) {
-        MessageBoxW(window, L"请选择有效的服务器分组。", L"SLink", MB_OK | MB_ICONWARNING);
+        ::SLink::ui::ShowMessageDialog(
+            window, L"请选择有效的服务器分组。", L"SLink", MB_OK | MB_ICONWARNING);
         return false;
     }
     output.profile.group_id =
@@ -768,7 +763,8 @@ bool ValidateAndCloseProfileEditor(HWND window, ProfileEditorState& state) {
                    state.initial.credential_ref) {
             output.credential_update = CredentialUpdate::Keep;
         } else {
-            MessageBoxW(window, L"请选择私钥文件。", L"SLink", MB_OK | MB_ICONWARNING);
+            ::SLink::ui::ShowMessageDialog(
+                window, L"请选择私钥文件。", L"SLink", MB_OK | MB_ICONWARNING);
             SetFocus(state.browse_private_key);
             return false;
         }
@@ -1213,10 +1209,10 @@ void NotifyProfilesChanged(ServerManagerState& state) {
         try {
             state.changed_callback();
         } catch (...) {
-            MessageBoxW(state.list,
-                        L"服务器配置已保存，但刷新主界面时发生错误。",
-                        L"SLink",
-                        MB_OK | MB_ICONWARNING);
+            ::SLink::ui::ShowMessageDialog(state.list,
+                                           L"服务器配置已保存，但刷新主界面时发生错误。",
+                                           L"SLink",
+                                           MB_OK | MB_ICONWARNING);
         }
     }
 }
@@ -1339,7 +1335,7 @@ void DeleteSelectedServer(HWND owner, ServerManagerState& state) {
     const auto profile = state.profiles[static_cast<std::size_t>(index)];
     const std::wstring message =
         L"确定删除服务器“" + Utf8ToWide(profile.name) + L"”吗？\r\n\r\n此操作不会删除远端文件。";
-    if (MessageBoxW(
+    if (::SLink::ui::ShowMessageDialog(
             owner, message.c_str(), L"删除服务器", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) !=
         IDYES) {
         return;
@@ -1408,7 +1404,8 @@ EnteredGroupName(HWND window, const GroupManagerState& state, const std::string&
     std::wstring name = WindowText(state.name);
     const auto first = name.find_first_not_of(L" \t\r\n");
     if (first == std::wstring::npos) {
-        MessageBoxW(window, L"请输入分组名称。", L"SLink", MB_OK | MB_ICONWARNING);
+        ::SLink::ui::ShowMessageDialog(
+            window, L"请输入分组名称。", L"SLink", MB_OK | MB_ICONWARNING);
         SetFocus(state.name);
         return std::nullopt;
     }
@@ -1417,14 +1414,16 @@ EnteredGroupName(HWND window, const GroupManagerState& state, const std::string&
         if (group.id != except_id &&
             CompareStringOrdinal(name.c_str(), -1, Utf8ToWide(group.name).c_str(), -1, TRUE) ==
                 CSTR_EQUAL) {
-            MessageBoxW(window, L"该分组名称已存在。", L"SLink", MB_OK | MB_ICONWARNING);
+            ::SLink::ui::ShowMessageDialog(
+                window, L"该分组名称已存在。", L"SLink", MB_OK | MB_ICONWARNING);
             SetFocus(state.name);
             return std::nullopt;
         }
     }
     auto encoded = WideToUtf8(name);
     if (!encoded || encoded->empty()) {
-        MessageBoxW(window, L"分组名称包含无效字符。", L"SLink", MB_OK | MB_ICONWARNING);
+        ::SLink::ui::ShowMessageDialog(
+            window, L"分组名称包含无效字符。", L"SLink", MB_OK | MB_ICONWARNING);
         return std::nullopt;
     }
     return encoded;
@@ -1547,7 +1546,7 @@ LRESULT CALLBACK GroupManagerProc(HWND window, UINT message, WPARAM wparam, LPAR
                     highest = (std::max)(highest, existing.sort_order);
                 }
                 if (highest == (std::numeric_limits<std::int32_t>::max)()) {
-                    MessageBoxW(
+                    ::SLink::ui::ShowMessageDialog(
                         window, L"分组数量已达到排序上限。", L"SLink", MB_OK | MB_ICONWARNING);
                     return 0;
                 }
@@ -1580,10 +1579,11 @@ LRESULT CALLBACK GroupManagerProc(HWND window, UINT message, WPARAM wparam, LPAR
             });
             const auto prompt = L"删除分组“" + Utf8ToWide(group.name) + L"”？\r\n" +
                                 std::to_wstring(count) + L" 台服务器将移到“未分组”，不会被删除。";
-            if (MessageBoxW(window,
-                            prompt.c_str(),
-                            L"删除分组",
-                            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+            if (::SLink::ui::ShowMessageDialog(window,
+                                               prompt.c_str(),
+                                               L"删除分组",
+                                               MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) !=
+                IDYES) {
                 return 0;
             }
             const auto removed = state->repository->RemoveServerGroupAndUngroup(group.id);
@@ -2067,7 +2067,8 @@ bool ShowServerManagerDialog(HWND owner,
     }
     HINSTANCE instance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(owner, GWLP_HINSTANCE));
     if (!RegisterServerManagerClass(instance)) {
-        MessageBoxW(owner, L"无法注册服务器管理窗口。", L"SLink", MB_OK | MB_ICONERROR);
+        ::SLink::ui::ShowMessageDialog(
+            owner, L"无法注册服务器管理窗口。", L"SLink", MB_OK | MB_ICONERROR);
         return false;
     }
     ServerManagerState state;
@@ -2088,7 +2089,8 @@ bool ShowServerManagerDialog(HWND owner,
                                   instance,
                                   &state);
     if (!window) {
-        MessageBoxW(owner, L"无法创建服务器管理窗口。", L"SLink", MB_OK | MB_ICONERROR);
+        ::SLink::ui::ShowMessageDialog(
+            owner, L"无法创建服务器管理窗口。", L"SLink", MB_OK | MB_ICONERROR);
         return false;
     }
     CenterWindow(window, owner);

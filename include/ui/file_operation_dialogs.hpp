@@ -22,4 +22,15 @@ std::optional<PermissionDialogResult> ShowPermissionDialog(HWND owner,
 std::optional<std::wstring>
 ShowRenameDialog(HWND owner, std::wstring current_name, bool local_path);
 
+enum class UnsavedFileChoice {
+    Cancel,
+    Save,
+    Discard,
+    KeepDraft
+};
+// 只返回用户决策；保存、清理草稿等操作仍由编辑控制器执行。
+UnsavedFileChoice ShowUnsavedFileDialog(HWND owner, std::wstring document_label);
+// 程序内 OK/YESNO 提示框，保留返回值与默认按钮语义；其他按钮类型由系统安全兜底。
+int ShowMessageDialog(HWND owner, const wchar_t* message, const wchar_t* title, UINT flags);
+
 } // namespace SLink::ui

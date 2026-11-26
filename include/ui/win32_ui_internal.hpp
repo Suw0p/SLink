@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ui/file_operation_dialogs.hpp"
 #include "ui/theme.hpp"
 
 #include <windows.h>
@@ -40,13 +41,85 @@ inline UINT WindowDpi(HWND hwnd) {
     return get_dpi ? get_dpi(hwnd) : 96;
 }
 
+inline void UpdateFallbackWindowCorners(HWND hwnd) {
+    if (!GetPropW(hwnd, L"SLink.RoundedFrameFallback"))
+        return;
+    if (IsZoomed(hwnd) || IsIconic(hwnd)) {
+        SetWindowRgn(hwnd, nullptr, TRUE);
+        return;
+    }
+    RECT bounds{};
+    GetWindowRect(hwnd, &bounds);
+    const int diameter = ScaleForDpi(18, WindowDpi(hwnd));
+    const auto region = CreateRoundRectRgn(
+        0, 0, bounds.right - bounds.left + 1, bounds.bottom - bounds.top + 1, diameter, diameter);
+    if (region && !SetWindowRgn(hwnd, region, TRUE))
+        DeleteObject(region); // 成功后 region 的所有权属于系统。
+}
+
+inline LRESULT CALLBACK
+RoundedFrameProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR) {
+    const auto result = DefSubclassProc(hwnd, message, wp, lp);
+    if (message == WM_SIZE || message == WM_DPICHANGED)
+        UpdateFallbackWindowCorners(hwnd);
+    if (message == WM_NCDESTROY) {
+        RemovePropW(hwnd, L"SLink.RoundedFrameFallback");
+        RemoveWindowSubclass(hwnd, RoundedFrameProc, id);
+    }
+    return result;
+}
+
 inline void EnableDarkTitleBar(HWND hwnd) {
+    if (!hwnd || (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CHILD))
+        return;
     BOOL enabled = theme::IsDark() ? TRUE : FALSE;
     constexpr DWORD kDwmUseImmersiveDarkMode = 20;
     if (FAILED(DwmSetWindowAttribute(hwnd, kDwmUseImmersiveDarkMode, &enabled, sizeof(enabled)))) {
         constexpr DWORD kLegacyDwmUseImmersiveDarkMode = 19;
         DwmSetWindowAttribute(hwnd, kLegacyDwmUseImmersiveDarkMode, &enabled, sizeof(enabled));
     }
+    const DWORD corner = 2; // DWMWCP_ROUND；主窗口保留 DWM 管理，不使用窗口区域裁剪。
+    DwmSetWindowAttribute(hwnd, 33, &corner, sizeof(corner));
+    const auto style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    const bool custom_frame = (style & WS_CAPTION) != WS_CAPTION;
+    const COLORREF border = custom_frame ? 0xfffffffeU /* DWMWA_COLOR_NONE */ : theme::kBorderColor;
+    const COLORREF caption = theme::kPanelColor, text = theme::kTextColor;
+    DwmSetWindowAttribute(hwnd, 34, &border, sizeof(border));
+    DwmSetWindowAttribute(hwnd, 35, &caption, sizeof(caption));
+    DwmSetWindowAttribute(hwnd, 36, &text, sizeof(text));
+}
+
+// 固定尺寸弹窗的样式修整与裁剪不能应用于主窗口。可缩放窗口有自己的非客户区
+// 与命中测试约定，必须独立处理，不能用弹窗裁剪掩盖尚未自绘覆盖的系统外框。
+inline void ApplyPopupWindowTheme(HWND hwnd) {
+    EnableDarkTitleBar(hwnd);
+    if (!hwnd || (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CHILD))
+        return;
+    const auto style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    if (style & WS_THICKFRAME)
+        return; // 可缩放窗口不能退回固定尺寸弹窗的区域裁剪路径。
+    const bool custom_frame = (style & WS_CAPTION) != WS_CAPTION;
+    const DWORD corner = 2;
+    const auto rounded = DwmSetWindowAttribute(hwnd, 33, &corner, sizeof(corner));
+    // 无标题栏弹窗不能保留 DLGFRAME/WS_BORDER，否则仍会出现系统的浅色内边。
+    if (custom_frame && (style & (WS_BORDER | WS_DLGFRAME))) {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~(WS_BORDER | WS_DLGFRAME));
+    }
+    const auto extended = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (extended & WS_EX_DLGMODALFRAME)
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, extended & ~WS_EX_DLGMODALFRAME);
+    if (custom_frame || FAILED(rounded)) {
+        SetPropW(hwnd, L"SLink.RoundedFrameFallback", reinterpret_cast<HANDLE>(1));
+        SetWindowSubclass(hwnd, RoundedFrameProc, 0x534c5246, 0);
+        UpdateFallbackWindowCorners(hwnd);
+    }
+    SetWindowPos(hwnd,
+                 nullptr,
+                 0,
+                 0,
+                 0,
+                 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
 
 inline HWND RootWindowForModalOwner(const HWND candidate) {

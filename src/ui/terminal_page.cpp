@@ -593,7 +593,8 @@ struct TerminalPage::Impl {
 
     void ShowPaneCreationFailure() const {
         const HWND previous_focus = GetFocus();
-        MessageBoxW(hwnd, L"无法创建终端，请检查系统资源。", L"SLink", MB_OK | MB_ICONERROR);
+        ::SLink::ui::ShowMessageDialog(
+            hwnd, L"无法创建终端，请检查系统资源。", L"SLink", MB_OK | MB_ICONERROR);
         if (previous_focus && IsWindow(previous_focus)) {
             SetFocus(previous_focus);
         }

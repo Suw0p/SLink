@@ -700,6 +700,74 @@ struct RemoteDocument::Impl {
     bool checkpoint_needed{true};
     std::filesystem::path cache_path;
     std::filesystem::path metadata_path;
+    std::optional<CacheMetadata> baseline;
+
+    std::filesystem::path baseline_metadata_path() const {
+        auto path = metadata_path;
+        path.replace_extension(L".baseline");
+        return path;
+    }
+
+    void load_baseline() {
+        auto bytes = ReadLocalFile(baseline_metadata_path(), kMaxMetadataBytes);
+        if (!bytes)
+            return;
+        auto saved = DeserializeMetadata(bytes.value());
+        if (saved && !saved.value().dirty && saved.value().uri == uri.to_string())
+            baseline = std::move(saved).value();
+    }
+
+    EditorStatus clear_baseline() {
+        if (!baseline)
+            load_baseline();
+        if (baseline) {
+            const auto original = CommittedContentPath(metadata_path, *baseline);
+            if (original != cache_path) {
+                if (auto status = RemoveCacheFile(original); !status)
+                    return status;
+            }
+        }
+        if (auto status = RemoveCacheFile(baseline_metadata_path()); !status)
+            return status;
+        baseline.reset();
+        return EditorStatus::Ok();
+    }
+
+    EditorStatus retain_baseline() {
+        if (baseline && baseline->revision.content_sha256 != base_revision.content_sha256) {
+            if (auto status = clear_baseline(); !status)
+                return status;
+        }
+        if (baseline || dirty)
+            return EditorStatus::Ok();
+        auto original = metadata();
+        if (auto status =
+                WriteLocalAtomically(baseline_metadata_path(), SerializeMetadata(original));
+            !status)
+            return status;
+        // 仅保留已有不可变内容代次，不为每个文件长期复制一份内存正文。
+        baseline = std::move(original);
+        return EditorStatus::Ok();
+    }
+
+    bool matches_base(std::string_view current, TextEncoding format) const {
+        if (format == TextEncoding::Gb2312) {
+            auto encoded = EncodeGb2312(current);
+            return encoded && encoded->size() == base_revision.size &&
+                   Sha256(*encoded) == base_revision.content_sha256;
+        }
+        const bool bom = format == TextEncoding::Utf8Bom;
+        if (current.size() + (bom ? 3U : 0U) != base_revision.size)
+            return false;
+        const auto hash = HashWithFeed([&](const auto& update) {
+            constexpr std::array prefix{std::byte{0xef}, std::byte{0xbb}, std::byte{0xbf}};
+            if (bom)
+                update(prefix);
+            update(std::span<const std::byte>(reinterpret_cast<const std::byte*>(current.data()),
+                                              current.size()));
+        });
+        return hash == base_revision.content_sha256;
+    }
 
     CacheMetadata metadata() const {
         return {dirty,
@@ -739,9 +807,12 @@ struct RemoteDocument::Impl {
             return status;
         }
         const auto previous = std::exchange(cache_path, next_content);
-        if (previous != cache_path)
+        if (previous != cache_path &&
+            (!baseline || previous != CommittedContentPath(metadata_path, *baseline)))
             (void)RemoveCacheFile(previous);
         checkpoint_needed = false;
+        if (!dirty)
+            (void)clear_baseline();
         return EditorStatus::Ok();
     }
 };
@@ -779,6 +850,29 @@ bool RemoteDocument::dirty() const noexcept {
 }
 const std::filesystem::path& RemoteDocument::cache_path() const noexcept {
     return impl_->cache_path;
+}
+
+EditorResult<OriginalDocumentText> RemoteDocument::OriginalText() const {
+    if (impl_->closed || impl_->mode != DocumentMode::Editable)
+        return EditorResult<OriginalDocumentText>::Failure(
+            EditorStatus::Error(EditorErrc::Unsupported, "Document is not editable"));
+    if (!impl_->dirty)
+        return EditorResult<OriginalDocumentText>::Success({impl_->text, impl_->encoding});
+    if (!impl_->baseline ||
+        impl_->baseline->revision.content_sha256 != impl_->base_revision.content_sha256)
+        return EditorResult<OriginalDocumentText>::Failure(
+            EditorStatus::Error(EditorErrc::NotFound,
+                                "This recovered draft has no original snapshot; it was not "
+                                "compared with the current remote file"));
+    auto bytes = ReadLocalFile(CommittedContentPath(impl_->metadata_path, *impl_->baseline),
+                               RemoteEditorService::kInternalTextSizeLimit);
+    if (!bytes || bytes.value().size() != impl_->baseline->content_size ||
+        Sha256(bytes.value()) != impl_->baseline->content_sha256)
+        return EditorResult<OriginalDocumentText>::Failure(EditorStatus::Error(
+            EditorErrc::CorruptCache, "Original snapshot is missing or corrupt"));
+    return EditorResult<OriginalDocumentText>::Success(
+        {std::string(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size()),
+         impl_->baseline->encoding});
 }
 
 EditorStatus RemoteDocument::RebindEndpoint(std::shared_ptr<IFileEndpoint> endpoint) {
@@ -828,8 +922,15 @@ EditorStatus RemoteDocument::UpdateText(std::string text,
         return EditorStatus::Error(EditorErrc::Unsupported, "Edited document exceeds 20 MB");
     }
     // 快照/当前正文已各占一份，回滚只需转移旧缓冲所有权，不再额外复制整份文件。
-    if (impl_->dirty && next_encoding == impl_->encoding && text == impl_->text)
+    if (!impl_->dirty && next_encoding == impl_->encoding && text == impl_->text)
         return impl_->checkpoint();
+    const bool next_dirty = !impl_->matches_base(text, next_encoding);
+    if (impl_->dirty && next_dirty && next_encoding == impl_->encoding && text == impl_->text)
+        return impl_->checkpoint();
+    if (next_dirty) {
+        if (auto status = impl_->retain_baseline(); !status)
+            return status;
+    }
     auto previous = std::move(impl_->text);
     const auto previous_encoding = impl_->encoding;
     const auto previous_eol = impl_->eol;
@@ -838,7 +939,7 @@ EditorStatus RemoteDocument::UpdateText(std::string text,
     impl_->text = std::move(text);
     impl_->encoding = next_encoding;
     impl_->eol = DetectEol(impl_->text);
-    impl_->dirty = true;
+    impl_->dirty = next_dirty;
     impl_->checkpoint_needed = true;
     if (auto status = impl_->checkpoint(); !status) {
         impl_->text = std::move(previous);
@@ -1063,6 +1164,7 @@ EditorResult<SaveResult> RemoteDocument::SaveAs(FileUri target, const bool repla
     const auto old_revision = impl_->base_revision;
     const bool old_dirty = impl_->dirty;
     const bool old_checkpoint_needed = impl_->checkpoint_needed;
+    auto old_baseline = std::exchange(impl_->baseline, std::nullopt);
     const auto cache_dir = old_cache_path.parent_path();
     impl_->uri = std::move(target);
     impl_->base_revision = ToRevision(saved_stat, Sha256(bytes));
@@ -1078,6 +1180,7 @@ EditorResult<SaveResult> RemoteDocument::SaveAs(FileUri target, const bool repla
         impl_->cache_path = old_cache_path;
         impl_->metadata_path = old_metadata_path;
         impl_->checkpoint_needed = old_checkpoint_needed;
+        impl_->baseline = std::move(old_baseline);
         return EditorResult<SaveResult>::Failure(std::move(status));
     }
     impl_->cache_lease = std::move(target_lease);
@@ -1086,6 +1189,11 @@ EditorResult<SaveResult> RemoteDocument::SaveAs(FileUri target, const bool repla
     }
     if (old_metadata_path != impl_->metadata_path) {
         RemoveCacheFile(old_metadata_path);
+        if (old_baseline)
+            (void)RemoveCacheFile(CommittedContentPath(old_metadata_path, *old_baseline));
+        auto old_baseline_path = old_metadata_path;
+        old_baseline_path.replace_extension(L".baseline");
+        (void)RemoveCacheFile(old_baseline_path);
     }
     return EditorResult<SaveResult>::Success({});
 }
@@ -1103,6 +1211,8 @@ EditorStatus RemoteDocument::Close() {
         impl_->cache_lease.reset();
         return EditorStatus::Ok();
     }
+    if (auto status = impl_->clear_baseline(); !status)
+        return status;
     const auto content_status = RemoveCacheFile(impl_->cache_path);
     const auto metadata_status = RemoveCacheFile(impl_->metadata_path);
     if (!content_status)
@@ -1269,6 +1379,16 @@ EditorResult<std::vector<RecoveryEntry>> RemoteEditorService::RecoverableDocumen
         }
         auto content_path = CommittedContentPath(item.path(), metadata.value());
         if (!metadata.value().dirty) {
+            // 保存后崩溃可能只来得及提交干净 .meta，补清理同一 URI 的原版本指针。
+            auto baseline_path = item.path();
+            baseline_path.replace_extension(L".baseline");
+            if (auto old_bytes = ReadLocalFile(baseline_path, kMaxMetadataBytes); old_bytes) {
+                auto old = DeserializeMetadata(old_bytes.value());
+                if (old && !old.value().dirty && old.value().uri == metadata.value().uri) {
+                    (void)RemoveCacheFile(CommittedContentPath(item.path(), old.value()));
+                    (void)RemoveCacheFile(baseline_path);
+                }
+            }
             std::filesystem::remove(content_path, error);
             error.clear();
             std::filesystem::remove(item.path(), error);
@@ -1346,6 +1466,7 @@ RemoteEditorService::Recover(std::shared_ptr<IFileEndpoint> endpoint,
     impl->dirty = true;
     impl->cache_path = entry.content_path;
     impl->metadata_path = entry.metadata_path;
+    impl->load_baseline();
     // 内容和元数据刚经哈希校验，关闭时无需再次写入同一份已提交恢复记录。
     impl->checkpoint_needed = false;
     impl->text.assign(

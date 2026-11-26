@@ -148,6 +148,11 @@ struct RecoveryEntry {
     RemoteRevision base_revision;
 };
 
+struct OriginalDocumentText {
+    std::string text;
+    TextEncoding encoding{TextEncoding::Utf8};
+};
+
 class RemoteDocument {
 public:
     ~RemoteDocument();
@@ -163,6 +168,8 @@ public:
     [[nodiscard]] const std::string& text() const noexcept;
     [[nodiscard]] bool dirty() const noexcept;
     [[nodiscard]] const std::filesystem::path& cache_path() const noexcept;
+    // 只读取打开/保存时保留的本地基线，不访问当前远端版本。
+    EditorResult<OriginalDocumentText> OriginalText() const;
 
     // SSH/SFTP 断线重连后替换文档使用的端点。文本、dirty 状态、缓存和
     // 打开时的远端修订基线全部保留，下一次保存仍会执行冲突检查。

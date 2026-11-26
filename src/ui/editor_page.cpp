@@ -33,6 +33,386 @@ namespace {
 #endif
 
 constexpr wchar_t kEditorPageClass[] = L"SLink.EditorPage";
+constexpr wchar_t kChangesViewClass[] = L"SLink.EditorChanges";
+
+struct ChangesViewContext {
+    HWND editor{};
+    HWND horizontal{}, vertical{};
+    HMODULE module{};
+    bool window_owned{};
+    std::string report;
+    struct ScrollMetrics {
+        int maximum{}, position{}, length{}, thumb_start{}, thumb_length{};
+    };
+    int drag_offset{};
+    HWND dragging{};
+    std::size_t maximum_columns{};
+    LRESULT measured_cell_width{};
+    LRESULT measured_tab_width{};
+    UINT measured_dpi{};
+    bool updating_scrollbars{};
+    void RefreshScrollWidth() {
+        if (!editor || !horizontal)
+            return;
+        const auto cell = std::max<LRESULT>(
+            1, SendMessageA(editor, 2276 /* TEXTWIDTH */, 32, reinterpret_cast<LPARAM>("M")));
+        const auto dpi = detail::WindowDpi(editor);
+        const auto tab = SendMessageW(editor, 2121 /* GETTABWIDTH */, 0, 0);
+        const bool font_changed =
+            cell != measured_cell_width || dpi != measured_dpi || tab != measured_tab_width;
+        const auto limit = static_cast<LRESULT>((std::numeric_limits<int>::max)());
+        auto width = font_changed ? std::min<LRESULT>(limit,
+                                                      static_cast<LRESULT>(maximum_columns) * cell +
+                                                          detail::ScaleForDpi(24, dpi))
+                                  : SendMessageW(editor, 2275 /* GETSCROLLWIDTH */, 0, 0);
+        // 仅测量已可见行的真实排版位置，修正字体回退等宽度差异；不在 UI 线程遍历
+        // 十万行重新排版。预估宽度覆盖未显示行，滚动到新行时再扩大真实范围。
+        const auto first = SendMessageW(editor, 2152 /* GETFIRSTVISIBLELINE */, 0, 0);
+        const auto last = std::min<LRESULT>(
+            SendMessageW(editor, 2154 /* GETLINECOUNT */, 0, 0),
+            first + std::max<LRESULT>(1, SendMessageW(editor, 2370 /* LINESONSCREEN */, 0, 0)) + 1);
+        const auto offset = SendMessageW(editor, 2398 /* GETXOFFSET */, 0, 0);
+        for (auto line = first; line < last; ++line) {
+            const auto end = SendMessageW(editor, 2136 /* GETLINEENDPOSITION */, line, 0);
+            width = std::max(
+                width,
+                std::min<LRESULT>(limit,
+                                  SendMessageW(editor, 2164 /* POINTXFROMPOSITION */, 0, end) +
+                                      offset + detail::ScaleForDpi(12, dpi)));
+        }
+        measured_cell_width = cell;
+        measured_tab_width = tab;
+        measured_dpi = dpi;
+        if (width != SendMessageW(editor, 2275, 0, 0))
+            SendMessageW(editor, 2274 /* SETSCROLLWIDTH */, width, 0);
+    }
+    ScrollMetrics Metrics(HWND bar) const {
+        const bool across = bar == horizontal;
+        RECT rc{};
+        GetClientRect(bar, &rc);
+        RECT body{};
+        GetClientRect(editor, &body);
+        ScrollMetrics m;
+        m.length = std::max(1L, across ? rc.right : rc.bottom);
+        const int page =
+            across ? std::max(1L, body.right - detail::ScaleForDpi(24, detail::WindowDpi(editor)))
+                   : std::max(
+                         1, static_cast<int>(SendMessageW(editor, 2370 /* LINESONSCREEN */, 0, 0)));
+        const int total = std::max(
+            page,
+            static_cast<int>(SendMessageW(
+                editor, across ? 2275 /* GETSCROLLWIDTH */ : 2154 /* GETLINECOUNT */, 0, 0)));
+        m.maximum = total - page;
+        m.position = std::clamp(
+            static_cast<int>(SendMessageW(
+                editor, across ? 2398 /* GETXOFFSET */ : 2152 /* GETFIRSTVISIBLELINE */, 0, 0)),
+            0,
+            m.maximum);
+        m.thumb_length =
+            std::clamp(MulDiv(m.length, page, total),
+                       std::min(m.length, detail::ScaleForDpi(20, detail::WindowDpi(editor))),
+                       m.length);
+        m.thumb_start =
+            m.maximum > 0 ? MulDiv(m.length - m.thumb_length, m.position, m.maximum) : 0;
+        return m;
+    }
+    void UpdateScrollbars() {
+        if (updating_scrollbars)
+            return;
+        updating_scrollbars = true;
+        RefreshScrollWidth();
+        for (auto bar : {horizontal, vertical}) {
+            if (!bar)
+                continue;
+            ShowWindow(bar, Metrics(bar).maximum > 0 ? SW_SHOWNOACTIVATE : SW_HIDE);
+            InvalidateRect(bar, nullptr, FALSE);
+        }
+        updating_scrollbars = false;
+    }
+    void ScrollTo(HWND bar, int coordinate) {
+        const auto m = Metrics(bar);
+        const auto value =
+            MulDiv(std::clamp(coordinate - drag_offset, 0, std::max(0, m.length - m.thumb_length)),
+                   m.maximum,
+                   std::max(1, m.length - m.thumb_length));
+        SendMessageW(editor,
+                     bar == horizontal ? 2397 /* SETXOFFSET */ : 2613 /* SETFIRSTVISIBLELINE */,
+                     value,
+                     0);
+        UpdateScrollbars();
+    }
+    void Layout(HWND view) {
+        RECT rc{};
+        GetClientRect(view, &rc);
+        const int size = detail::ScaleForDpi(8, detail::WindowDpi(view));
+        const int width = std::max(0L, rc.right - size), height = std::max(0L, rc.bottom - size);
+        MoveWindow(editor, 0, 0, width, height, TRUE);
+        MoveWindow(horizontal, 0, height, width, size, TRUE);
+        MoveWindow(vertical, width, 0, size, height, TRUE);
+        UpdateScrollbars();
+    }
+    static LRESULT CALLBACK
+    ScrollProc(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR value) {
+        auto* self = reinterpret_cast<ChangesViewContext*>(value);
+        const bool across = window == self->horizontal;
+        if (message == WM_PAINT || message == WM_PRINTCLIENT) {
+            PAINTSTRUCT paint{};
+            const auto dc =
+                message == WM_PAINT ? BeginPaint(window, &paint) : reinterpret_cast<HDC>(wp);
+            RECT rc{};
+            GetClientRect(window, &rc);
+            const auto background = CreateSolidBrush(theme::TerminalBackgroundColor());
+            FillRect(dc, &rc, background);
+            DeleteObject(background);
+            const auto m = self->Metrics(window);
+            RECT thumb =
+                across
+                    ? RECT{m.thumb_start + 1, 1, m.thumb_start + m.thumb_length - 1, rc.bottom - 1}
+                    : RECT{1, m.thumb_start + 1, rc.right - 1, m.thumb_start + m.thumb_length - 1};
+            const auto fill =
+                CreateSolidBrush(theme::IsDark() ? RGB(80, 83, 89) : RGB(164, 169, 178));
+            const auto previous_brush = SelectObject(dc, fill);
+            const auto previous_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+            RoundRect(dc, thumb.left, thumb.top, thumb.right, thumb.bottom, 6, 6);
+            SelectObject(dc, previous_pen);
+            SelectObject(dc, previous_brush);
+            DeleteObject(fill);
+            if (message == WM_PAINT)
+                EndPaint(window, &paint);
+            return 0;
+        }
+        if (message == WM_ERASEBKGND)
+            return 1;
+        if (message == WM_LBUTTONDOWN) {
+            const auto m = self->Metrics(window);
+            const int coordinate = across ? GET_X_LPARAM(lp) : GET_Y_LPARAM(lp);
+            self->drag_offset =
+                coordinate >= m.thumb_start && coordinate < m.thumb_start + m.thumb_length
+                    ? coordinate - m.thumb_start
+                    : m.thumb_length / 2;
+            self->dragging = window;
+            SetCapture(window);
+            self->ScrollTo(window, coordinate);
+            return 0;
+        }
+        if (message == WM_MOUSEMOVE && GetCapture() == window && self->dragging == window) {
+            self->ScrollTo(window, across ? GET_X_LPARAM(lp) : GET_Y_LPARAM(lp));
+            return 0;
+        }
+        if (message == WM_LBUTTONUP && GetCapture() == window) {
+            ReleaseCapture();
+            return 0;
+        }
+        if (message == WM_CAPTURECHANGED)
+            self->dragging = nullptr;
+        if (message == WM_MOUSEWHEEL) {
+            SendMessageW(self->editor, message, wp, lp);
+            return 0;
+        }
+        if (message == WM_NCDESTROY)
+            RemoveWindowSubclass(window, ScrollProc, id);
+        return DefSubclassProc(window, message, wp, lp);
+    }
+    static LRESULT CALLBACK
+    EditorProc(HWND editor, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR value) {
+        auto* self = reinterpret_cast<ChangesViewContext*>(value);
+        if (message == WM_MOUSEHWHEEL) {
+            const auto m = self->Metrics(self->horizontal);
+            SendMessageW(
+                editor,
+                2397,
+                std::clamp(m.position + MulDiv(GET_WHEEL_DELTA_WPARAM(wp),
+                                               detail::ScaleForDpi(48, detail::WindowDpi(editor)),
+                                               WHEEL_DELTA),
+                           0,
+                           m.maximum),
+                0);
+            self->UpdateScrollbars();
+            return 0;
+        }
+        if (message == WM_NCDESTROY)
+            RemoveWindowSubclass(editor, EditorProc, id);
+        return DefSubclassProc(editor, message, wp, lp);
+    }
+    ~ChangesViewContext() {
+        if (module)
+            FreeLibrary(module);
+    }
+};
+
+LRESULT CALLBACK ChangesViewProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    auto* state = reinterpret_cast<ChangesViewContext*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        state = static_cast<ChangesViewContext*>(
+            reinterpret_cast<CREATESTRUCTW*>(lparam)->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+    }
+    if (!state)
+        return DefWindowProcW(window, message, wparam, lparam);
+    if (message == WM_CREATE) {
+        state->editor = CreateWindowExW(0,
+                                        L"Scintilla",
+                                        L"",
+                                        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        window,
+                                        reinterpret_cast<HMENU>(1),
+                                        GetModuleHandleW(nullptr),
+                                        nullptr);
+        if (!state->editor)
+            return -1;
+        SetWindowSubclass(
+            state->editor, ChangesViewContext::EditorProc, 1, reinterpret_cast<DWORD_PTR>(state));
+        const auto control = state->editor;
+        SendMessageW(control, 2037 /* SETCODEPAGE */, 65001, 0);
+        SendMessageA(control, 2056 /* STYLESETFONT */, 32, reinterpret_cast<LPARAM>("Consolas"));
+        SendMessageW(control, 2055 /* STYLESETSIZE */, 32, 11);
+        SendMessageW(control, 2051 /* STYLESETFORE */, 32, theme::kTextColor);
+        SendMessageW(control, 2052 /* STYLESETBACK */, 32, theme::TerminalBackgroundColor());
+        SendMessageW(control, 2050 /* STYLECLEARALL */, 0, 0);
+        SendMessageW(control, 2051, 1, theme::IsDark() ? RGB(239, 142, 142) : RGB(166, 40, 40));
+        SendMessageW(control, 2051, 2, theme::IsDark() ? RGB(147, 207, 155) : RGB(31, 115, 48));
+        for (int margin = 0; margin < 5; ++margin)
+            SendMessageW(control, 2242 /* SETMARGINWIDTHN */, margin, 0);
+        SendMessageW(control,
+                     2155 /* SETMARGINLEFT */,
+                     0,
+                     detail::ScaleForDpi(12, detail::WindowDpi(window)));
+        SendMessageA(
+            control, 2181 /* SETTEXT */, 0, reinterpret_cast<LPARAM>(state->report.c_str()));
+        std::size_t start = 0;
+        const auto tab_width =
+            std::max<LRESULT>(1, SendMessageW(control, 2121 /* GETTABWIDTH */, 0, 0));
+        while (start < state->report.size()) {
+            const auto newline = state->report.find('\n', start);
+            const auto end = newline == std::string::npos ? state->report.size() : newline + 1;
+            const int style = state->report[start] == '-' ? 1 : state->report[start] == '+' ? 2 : 0;
+            SendMessageW(control, 2032 /* STARTSTYLING */, start, 0);
+            SendMessageW(control, 2033 /* SETSTYLING */, end - start, style);
+            std::size_t columns = 0;
+            for (auto at = start; at < end; ++at) {
+                const auto byte = static_cast<unsigned char>(state->report[at]);
+                if (byte == '\t')
+                    columns += static_cast<std::size_t>(tab_width) -
+                               columns % static_cast<std::size_t>(tab_width);
+                else if (byte != '\r' && byte != '\n' && (byte & 0xc0U) != 0x80U)
+                    columns += byte < 0x80U ? 1 : 2;
+            }
+            state->maximum_columns = std::max(state->maximum_columns, columns);
+            start = end;
+        }
+        SendMessageW(control, 2075 /* EMPTYUNDOBUFFER */, 0, 0);
+        SendMessageW(control, 2171 /* SETREADONLY */, TRUE, 0);
+        // 改动快照与主编辑区一样禁用系统滚动条，避免底部/右侧留下白色非客户区。
+        SendMessageW(control, 2130 /* SETHSCROLLBAR */, FALSE, 0);
+        SendMessageW(control, 2280 /* SETVSCROLLBAR */, FALSE, 0);
+        // 隐藏原生横条后控件不会总是自动跟踪宽度，预估最宽行以保留横向浏览能力。
+        const auto cell_width = std::max<LRESULT>(
+            1, SendMessageA(control, 2276 /* TEXTWIDTH */, 32, reinterpret_cast<LPARAM>("M")));
+        SendMessageW(
+            control,
+            2274 /* SETSCROLLWIDTH */,
+            std::max<std::size_t>(1,
+                                  state->maximum_columns * static_cast<std::size_t>(cell_width) +
+                                      detail::ScaleForDpi(24, detail::WindowDpi(window))),
+            0);
+        SendMessageW(control, 2516 /* SETSCROLLWIDTHTRACKING */, TRUE, 0);
+        for (int id : {2, 3}) {
+            const auto bar = CreateWindowExW(0,
+                                             L"STATIC",
+                                             L"",
+                                             WS_CHILD | WS_CLIPSIBLINGS,
+                                             0,
+                                             0,
+                                             0,
+                                             0,
+                                             window,
+                                             reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                             GetModuleHandleW(nullptr),
+                                             nullptr);
+            if (!bar)
+                return -1;
+            (id == 2 ? state->horizontal : state->vertical) = bar;
+            SetWindowSubclass(
+                bar, ChangesViewContext::ScrollProc, id, reinterpret_cast<DWORD_PTR>(state));
+        }
+        std::string{}.swap(state->report);
+        detail::ApplyPopupWindowTheme(window);
+        return 0;
+    }
+    if (message == WM_SIZE) {
+        state->Layout(window);
+        return 0;
+    }
+    if (message == WM_DPICHANGED) {
+        const auto* bounds = reinterpret_cast<RECT*>(lparam);
+        SetWindowPos(window,
+                     nullptr,
+                     bounds->left,
+                     bounds->top,
+                     bounds->right - bounds->left,
+                     bounds->bottom - bounds->top,
+                     SWP_NOACTIVATE | SWP_NOZORDER);
+        state->measured_dpi = 0;
+        state->Layout(window);
+        return 0;
+    }
+    if (message == WM_NOTIFY && reinterpret_cast<NMHDR*>(lparam)->hwndFrom == state->editor) {
+        state->UpdateScrollbars();
+        return 0;
+    }
+    if (message == WM_MOUSEHWHEEL) {
+        SendMessageW(
+            state->editor,
+            2397,
+            std::max<LRESULT>(0,
+                              SendMessageW(state->editor, 2398, 0, 0) +
+                                  MulDiv(GET_WHEEL_DELTA_WPARAM(wparam),
+                                         detail::ScaleForDpi(48, detail::WindowDpi(window)),
+                                         WHEEL_DELTA)),
+            0);
+        state->UpdateScrollbars();
+        return 0;
+    }
+    if (message == WM_ERASEBKGND)
+        return 1;
+    if (message == WM_PAINT) {
+        PAINTSTRUCT paint{};
+        const auto dc = BeginPaint(window, &paint);
+        const auto fill = CreateSolidBrush(theme::TerminalBackgroundColor());
+        FillRect(dc, &paint.rcPaint, fill);
+        DeleteObject(fill);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    if (message == WM_SETFOCUS) {
+        SetFocus(state->editor);
+        return 0;
+    }
+    if (message == WM_THEMECHANGED) {
+        for (int style : {0, 1, 2, 32})
+            SendMessageW(
+                state->editor, 2052 /* STYLESETBACK */, style, theme::TerminalBackgroundColor());
+        for (int style : {0, 32})
+            SendMessageW(state->editor, 2051 /* STYLESETFORE */, style, theme::kTextColor);
+        SendMessageW(
+            state->editor, 2051, 1, theme::IsDark() ? RGB(239, 142, 142) : RGB(166, 40, 40));
+        SendMessageW(
+            state->editor, 2051, 2, theme::IsDark() ? RGB(147, 207, 155) : RGB(31, 115, 48));
+        state->UpdateScrollbars();
+        RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
+        return 0;
+    }
+    if (message == WM_NCDESTROY) {
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        if (state->window_owned)
+            delete state;
+    }
+    return DefWindowProcW(window, message, wparam, lparam);
+}
 constexpr wchar_t kEditorPathFrameClass[] = L"SLink.EditorPathFrame";
 constexpr wchar_t kEditorResizeGuideClass[] = L"SLink.EditorResizeGuide";
 constexpr COLORREF kResizeGuideTransparentColor = RGB(1, 2, 3);
@@ -49,6 +429,7 @@ constexpr int kEncodingSelectorId = 4121;
 constexpr int kTabPreviousId = 4122;
 constexpr int kTabNextId = 4123;
 constexpr int kStatusDetailsId = 4124;
+constexpr int kChangesId = 4125;
 constexpr int kDocumentTabFirstId = 4500;
 constexpr int kDocumentCloseFirstId = 5500;
 constexpr UINT kUpdateHorizontalScrollbarMessage = WM_APP + 0x231;
@@ -102,6 +483,7 @@ constexpr UINT kSciVisibleFromDocLine = 2220;
 constexpr UINT kSciEnsureVisible = 2232;
 constexpr UINT kSciPointYFromPosition = 2165;
 constexpr UINT kSciPointXFromPosition = 2164;
+constexpr UINT kSciPositionFromPointClose = 2023;
 constexpr UINT kSciTextHeight = 2279;
 constexpr UINT kSciScrollRange = 2569;
 constexpr UINT kSciLinesOnScreen = 2370;
@@ -110,6 +492,15 @@ constexpr UINT kSciGetXOffset = 2398;
 constexpr UINT kSciSetXOffset = 2397;
 constexpr UINT kSciSetEolMode = 2031;
 constexpr UINT kSciSetSavePoint = 2014;
+constexpr UINT kSciSetChangeHistory = 2780;
+constexpr UINT kSciMarkerDefine = 2040;
+constexpr UINT kSciMarkerSetBack = 2042;
+constexpr UINT kSciMarkerAdd = 2043;
+constexpr UINT kSciMarkerDeleteAll = 2045;
+constexpr UINT kSciMarkerNext = 2047;
+// 25–31 留给 Scintilla 折叠标记，不能放恢复后的改动锚点，否则整栏会使用折叠底色。
+constexpr int kRestoredChangeMarker = 20;
+constexpr unsigned kChangeMarkerMask = (1U << 23U) | (1U << 24U) | (1U << kRestoredChangeMarker);
 constexpr UINT kSciGetCurrentPos = 2008;
 constexpr UINT kSciLineFromPosition = 2166;
 constexpr UINT kSciGetColumn = 2129;
@@ -467,6 +858,9 @@ struct EditorPage::Impl {
         int character;
         int modifiers;
         int modification_type;
+        const char* text;
+        std::intptr_t length;
+        std::intptr_t lines_added;
     };
 
     struct DocumentState {
@@ -482,6 +876,10 @@ struct EditorPage::Impl {
         EditorDocumentKind kind{EditorDocumentKind::Text};
         bool read_only{};
         bool dirty{};
+        bool trusted_savepoint{};
+        EditorTextEncoding saved_encoding{EditorTextEncoding::Utf8};
+        std::vector<int> changed_lines;
+        std::size_t touched_mark_count{};
         bool saving{};
         bool closing{};
         bool preview_truncated{};
@@ -523,6 +921,15 @@ struct EditorPage::Impl {
     detail::FindBar find_bar;
     bool batch_replacing{};
     bool word_wrap{};
+    struct WrapViewportAnchor {
+        EditorDocumentId document{};
+        LRESULT position{};
+        int y{};
+        UINT dpi{96};
+    };
+    std::optional<WrapViewportAnchor> pending_wrap_viewport;
+    bool restoring_wrap_viewport{};
+    std::optional<int> find_bar_top;
     bool suppress_search_escape{};
     WPARAM suppress_search_character{};
     std::optional<EditorDocumentId> last_search_document;
@@ -589,6 +996,7 @@ struct EditorPage::Impl {
     CloseRequestCallback close_requested;
     DocumentChangedCallback document_changed;
     ActiveDocumentChangedCallback active_document_changed;
+    DocumentActionCallback changes_requested;
     FileActivationCallback file_activation;
     ServerChangedCallback server_changed;
     PathChangedCallback path_changed;
@@ -646,6 +1054,7 @@ struct EditorPage::Impl {
             // Force the pending text/layout paint before reading it.
             RedrawWindow(
                 self->editor, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+            self->RestoreWrapViewport();
             self->UpdateHorizontalScrollbar();
             return 0;
         case WM_MOUSEMOVE:
@@ -986,12 +1395,16 @@ struct EditorPage::Impl {
         const int width = std::max(
             0,
             std::min(m.right_width - gap * 2, detail::ScaleForDpi(240, detail::WindowDpi(hwnd))));
-        find_bar.Place(m.right_x + m.right_width - gap - width, m.header_height + gap, width);
+        const int top = std::clamp(
+            find_bar_top.value_or(gap), 0, std::max(0, m.editor_height - find_bar.height() - gap));
+        find_bar.Place(m.right_x + m.right_width - gap - width, m.editor_y + top, width);
     }
 
     void ShowFindBar(bool replace) {
         if (!ActiveDocument() || !scintilla_available || !IsWindowVisible(editor))
             return;
+        if (!find_bar.visible())
+            find_bar_top.reset();
         find_bar.Show(replace, editor);
         PlaceFindBar();
     }
@@ -1063,6 +1476,138 @@ struct EditorPage::Impl {
         return true;
     }
 
+    LRESULT TextLeftInset() const {
+        auto left = SendMessageW(editor, kSciGetMarginLeft, 0, 0);
+        const auto count = std::clamp<LRESULT>(SendMessageW(editor, kSciGetMargins, 0, 0), 1, 32);
+        for (LRESULT margin = 0; margin < count; ++margin)
+            left += std::max<LRESULT>(0, SendMessageW(editor, kSciGetMarginWidthN, margin, 0));
+        return left;
+    }
+
+    void CaptureWrapViewport() {
+        if (!editor || !scintilla_available || !active_id) {
+            pending_wrap_viewport.reset();
+            return;
+        }
+        // 设置页内连续切换时，始终保留第一次切换前的锚点，不使用中间的过期几何。
+        if (pending_wrap_viewport && pending_wrap_viewport->document == *active_id)
+            return;
+        RECT client{};
+        GetClientRect(editor, &client);
+        auto position = SendMessageW(editor, kSciGetCurrentPos, 0, 0);
+        const auto x = SendMessageW(editor, kSciPointXFromPosition, 0, position);
+        auto y = SendMessageW(editor, kSciPointYFromPosition, 0, position);
+        const auto height = std::max<LRESULT>(1, SendMessageW(editor, kSciTextHeight, 0, 0));
+        const auto left = TextLeftInset();
+        if (x < left || x >= client.right || y < 0 || y + height > client.bottom) {
+            // 光标已在屏幕外时，用户正在阅读别处，保留视口首个字符而非跳回光标。
+            position =
+                SendMessageW(editor,
+                             kSciPositionFromPointClose,
+                             std::clamp<LRESULT>(left + 1, 0, std::max(0L, client.right - 1)),
+                             height / 2);
+            y = 0;
+        }
+        pending_wrap_viewport = WrapViewportAnchor{*active_id,
+                                                   std::max<LRESULT>(0, position),
+                                                   static_cast<int>(y),
+                                                   detail::WindowDpi(editor)};
+    }
+
+    void AvoidFindBarForMatch(LRESULT start, LRESULT end) {
+        if (!find_bar.visible())
+            return;
+        RECT client{}, bar{};
+        GetClientRect(editor, &client);
+        GetClientRect(find_bar.hwnd(), &bar);
+        const int gap = detail::ScaleForDpi(6, detail::WindowDpi(hwnd));
+        const auto height =
+            static_cast<LONG>(std::max<LRESULT>(1, SendMessageW(editor, kSciTextHeight, 0, 0)));
+        const auto x = static_cast<LONG>(SendMessageW(editor, kSciPointXFromPosition, 0, start));
+        const auto y = static_cast<LONG>(SendMessageW(editor, kSciPointYFromPosition, 0, start));
+        const auto end_x = static_cast<LONG>(SendMessageW(editor, kSciPointXFromPosition, 0, end));
+        const auto end_y = static_cast<LONG>(SendMessageW(editor, kSciPointYFromPosition, 0, end));
+        RECT match{end_y == y ? x : 0,
+                   std::max(0L, y),
+                   end_y == y ? std::max(x + 2, end_x) : client.right,
+                   std::min(client.bottom, std::max(y, end_y) + height)};
+        const int max_top = std::max(0L, client.bottom - bar.bottom - gap);
+        const int normal_top = std::min(gap, max_top);
+        const auto at = [&](int top) -> RECT {
+            return {std::max(0L, client.right - gap - bar.right),
+                    top,
+                    client.right - gap,
+                    top + bar.bottom};
+        };
+        RECT intersection{};
+        int top = normal_top;
+        auto normal = at(top);
+        if (IntersectRect(&intersection, &normal, &match)) {
+            const auto choose = [&](RECT avoid) {
+                if (avoid.bottom + gap <= max_top) {
+                    top = avoid.bottom + gap;
+                    return true;
+                }
+                if (avoid.top - gap - bar.bottom >= 0) {
+                    top = avoid.top - gap - bar.bottom;
+                    return true;
+                }
+                return false;
+            };
+            if (!choose(match)) {
+                // 匹配跨越整个视口时优先露出开头；极矮视口保持零横向偏移。
+                RECT first{x, std::max(0L, y), client.right, std::min(client.bottom, y + height)};
+                (void)choose(first);
+            }
+        }
+        find_bar_top = top == normal_top ? std::nullopt : std::optional<int>(top);
+        PlaceFindBar();
+    }
+
+    void RestoreWrapViewport() {
+        if (!pending_wrap_viewport || restoring_wrap_viewport)
+            return;
+        if (active_id != pending_wrap_viewport->document) {
+            pending_wrap_viewport.reset();
+            return;
+        }
+        RECT client{};
+        GetClientRect(editor, &client);
+        if (!IsWindowVisible(editor) || IsIconic(GetAncestor(hwnd, GA_ROOT)) || client.right <= 0 ||
+            client.bottom <= 0)
+            return;
+        restoring_wrap_viewport = true;
+        struct Guard {
+            bool& flag;
+            ~Guard() {
+                flag = false;
+            }
+        } guard{restoring_wrap_viewport};
+        const auto anchor = *std::exchange(pending_wrap_viewport, std::nullopt);
+        const auto position =
+            std::clamp<LRESULT>(anchor.position, 0, SendMessageW(editor, kSciGetTextLength, 0, 0));
+        RedrawWindow(editor, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+        SendMessageW(editor, kSciScrollRange, position, position);
+        if (word_wrap)
+            SendMessageW(editor, kSciSetXOffset, 0, 0);
+        // 先完成目标段落折行，再按字节位置映射回新的显示行，不能复用旧显示行号。
+        RedrawWindow(editor, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+        const auto height = std::max<LRESULT>(1, SendMessageW(editor, kSciTextHeight, 0, 0));
+        const auto display_line =
+            SendMessageW(editor, kSciGetFirstVisibleLine, 0, 0) +
+            SendMessageW(editor, kSciPointYFromPosition, 0, position) / height;
+        const auto target_y =
+            std::clamp<LRESULT>(MulDiv(anchor.y, detail::WindowDpi(editor), anchor.dpi),
+                                0,
+                                std::max<LRESULT>(0, client.bottom - height));
+        SendMessageW(editor,
+                     kSciSetFirstVisibleLine,
+                     std::max<LRESULT>(0, display_line - target_y / height),
+                     0);
+        AvoidFindBarForMatch(position, position);
+        UpdateEditorScrollbarWindows();
+    }
+
     void RevealSearchMatch(LRESULT start, LRESULT end) {
         const auto line = SendMessageW(editor, kSciLineFromPosition, start, 0);
         SendMessageW(editor, kSciEnsureVisible, line, 0);
@@ -1073,27 +1618,19 @@ struct EditorPage::Impl {
                          0);
         // 优先显示匹配的开头，而不是只滚动到选区末端；长行也不会把开头滚走。
         UpdateScrollWidthForCurrentLine();
+        if (word_wrap)
+            SendMessageW(editor, kSciSetXOffset, 0, 0);
         SendMessageW(editor, kSciScrollRange, end, start);
         RECT client{};
         GetClientRect(editor, &client);
         const int line_height =
             static_cast<int>(std::max<LRESULT>(1, SendMessageW(editor, kSciTextHeight, line, 0)));
-        int safe_top = line_height;
-        RECT overlay{};
-        if (find_bar.visible()) {
-            GetWindowRect(find_bar.hwnd(), &overlay);
-            MapWindowPoints(HWND_DESKTOP, editor, reinterpret_cast<POINT*>(&overlay), 2);
-            const auto x = SendMessageW(editor, kSciPointXFromPosition, 0, start);
-            const auto last_x = SendMessageW(editor, kSciPointXFromPosition, 0, end);
-            if (last_x > overlay.left && x < overlay.right)
-                safe_top = std::max(safe_top, static_cast<int>(overlay.bottom) + line_height);
-        }
         const auto y = SendMessageW(editor, kSciPointYFromPosition, 0, start);
-        if (y < safe_top || y + line_height > client.bottom - line_height) {
+        if (y < line_height || y + line_height > client.bottom - line_height) {
             // 自动换行时同一文档行有多个显示行，定位到命中所在的那一段而非行首。
             const auto display_line = SendMessageW(editor, kSciGetFirstVisibleLine, 0, 0) +
                                       std::max<LRESULT>(0, y) / line_height;
-            const int preferred_y = std::max(safe_top, static_cast<int>(client.bottom) / 2);
+            const int preferred_y = static_cast<int>(client.bottom) / 2;
             const int usable_y = std::max(0, static_cast<int>(client.bottom) - line_height * 2);
             SendMessageW(
                 editor,
@@ -1101,22 +1638,10 @@ struct EditorPage::Impl {
                 std::max<LRESULT>(0, display_line - std::min(preferred_y, usable_y) / line_height),
                 0);
         }
-        // 文档头几行不能继续向下滚动。若结果仍在浮层下面，平移长行，让匹配
-        // 落到浮层左侧；不移动查找条或抢回键盘焦点。
-        if (!IsRectEmpty(&overlay)) {
-            const auto match_y = SendMessageW(editor, kSciPointYFromPosition, 0, start);
-            const auto match_x = SendMessageW(editor, kSciPointXFromPosition, 0, start);
-            const auto end_x = SendMessageW(editor, kSciPointXFromPosition, 0, end);
-            if (match_y < overlay.bottom && match_y + line_height > overlay.top &&
-                end_x > overlay.left && match_x < overlay.right) {
-                const auto margin = SendMessageW(editor, kSciGetMarginWidthN, 0, 0) +
-                                    SendMessageW(editor, kSciGetMarginLeft, 0, 0);
-                const auto delta = std::clamp<LRESULT>(
-                    end_x - overlay.left + line_height, 0, std::max<LRESULT>(0, match_x - margin));
-                SendMessageW(
-                    editor, kSciSetXOffset, SendMessageW(editor, kSciGetXOffset, 0, 0) + delta, 0);
-            }
-        }
+        // 只移动浮层避让匹配，尤其换行模式绝不能引入无法通过滚动条复位的 XOffset。
+        if (word_wrap)
+            SendMessageW(editor, kSciSetXOffset, 0, 0);
+        AvoidFindBarForMatch(start, end);
         UpdateEditorScrollbarWindows();
         InvalidateRect(editor, nullptr, FALSE);
     }
@@ -1267,6 +1792,10 @@ struct EditorPage::Impl {
         batch_replacing = false;
         if (count != 0) {
             document->dirty = true;
+            MarkTouchedLine(
+                *document,
+                SendMessageW(
+                    editor, kSciLineFromPosition, SendMessageW(editor, kSciGetTargetEnd, 0, 0), 0));
             UpdateLineNumberMargin();
             ScheduleHorizontalScrollbarUpdate();
             UpdateStatus();
@@ -1306,10 +1835,10 @@ struct EditorPage::Impl {
             if (target == EditorTextEncoding::Gb2312) {
                 auto decoded = editor::DecodeGb2312(text);
                 if (!decoded) {
-                    MessageBoxW(hwnd,
-                                L"文件中含有无效的 GB2312 字节，无法切换编码。",
-                                L"SLink",
-                                MB_OK | MB_ICONERROR);
+                    ::SLink::ui::ShowMessageDialog(hwnd,
+                                                   L"文件中含有无效的 GB2312 字节，无法切换编码。",
+                                                   L"SLink",
+                                                   MB_OK | MB_ICONERROR);
                     SendMessageW(encoding_selector, CB_SETCURSEL, static_cast<WPARAM>(-1), 0);
                     return;
                 }
@@ -1320,19 +1849,20 @@ struct EditorPage::Impl {
                                                             static_cast<int>(text.size()),
                                                             nullptr,
                                                             0) <= 0) {
-                MessageBoxW(hwnd,
-                            L"文件内容不是有效的 UTF-8，请选择 GB2312 或保持原编码。",
-                            L"SLink",
-                            MB_OK | MB_ICONERROR);
+                ::SLink::ui::ShowMessageDialog(
+                    hwnd,
+                    L"文件内容不是有效的 UTF-8，请选择 GB2312 或保持原编码。",
+                    L"SLink",
+                    MB_OK | MB_ICONERROR);
                 SendMessageW(encoding_selector, CB_SETCURSEL, static_cast<WPARAM>(-1), 0);
                 return;
             }
         }
         if (target == EditorTextEncoding::Gb2312 && !editor::EncodeGb2312(text)) {
-            MessageBoxW(hwnd,
-                        L"文本含有 GB2312 无法表示的字符，切换后无法无损保存。",
-                        L"SLink",
-                        MB_OK | MB_ICONERROR);
+            ::SLink::ui::ShowMessageDialog(hwnd,
+                                           L"文本含有 GB2312 无法表示的字符，切换后无法无损保存。",
+                                           L"SLink",
+                                           MB_OK | MB_ICONERROR);
             SendMessageW(encoding_selector,
                          CB_SETCURSEL,
                          document->encoding == EditorTextEncoding::Gb2312
@@ -1807,6 +2337,16 @@ struct EditorPage::Impl {
         SendMessageA(
             editor, kSciStyleSetFont, kStyleLineNumber, reinterpret_cast<LPARAM>("Consolas"));
         SendMessageW(editor, kSciStyleSetSize, kStyleLineNumber, 9);
+        // 跟随 STYLE_DEFAULT 背景，深色主题下不再出现系统默认的白边。
+        SendMessageW(editor, 2240 /* SCI_SETMARGINTYPEN */, 1, 2 /* SC_MARGIN_BACK */);
+        SendMessageW(editor, 2244 /* SCI_SETMARGINMASKN */, 1, kChangeMarkerMask);
+        SendMessageW(
+            editor, kSciSetMarginWidthN, 1, detail::ScaleForDpi(4, detail::WindowDpi(hwnd)));
+        for (int marker : {23, 24, kRestoredChangeMarker}) {
+            SendMessageW(editor, kSciMarkerDefine, marker, 27 /* SC_MARK_LEFTRECT */);
+            SendMessageW(
+                editor, kSciMarkerSetBack, marker, dark ? RGB(112, 162, 226) : RGB(53, 108, 183));
+        }
         SendMessageW(editor, kSciSetCaretFore, theme::kTextColor, 0);
         // 搜索时键盘焦点在查找框，仍需保留清晰的正文选区。用不透明底层配色，
         // 不再把高亮半透明地盖在字形上，也不让系统失焦灰色吞掉选区。
@@ -1824,7 +2364,7 @@ struct EditorPage::Impl {
         SendMessageW(editor, kSciSetCaretLineBack, dark ? RGB(43, 45, 49) : RGB(237, 240, 244), 0);
         // 当前行底色也放到文字下层，不能再用半透明覆盖层压暗选区及选中文字。
         SendMessageW(editor, kSciSetCaretLineLayer, 0 /* SC_LAYER_BASE */, 0);
-        SendMessageW(editor, kSciSetMarginLeft, 0, detail::ScaleForDpi(8, detail::WindowDpi(hwnd)));
+        SendMessageW(editor, kSciSetMarginLeft, 0, detail::ScaleForDpi(4, detail::WindowDpi(hwnd)));
         SendMessageW(
             editor, kSciSetMarginRight, 0, detail::ScaleForDpi(8, detail::WindowDpi(hwnd)));
         SendMessageW(
@@ -1923,6 +2463,21 @@ struct EditorPage::Impl {
             return;
         }
         document->content = EditorText();
+        document->changed_lines.clear();
+        for (LRESULT line = SendMessageW(editor, kSciMarkerNext, 0, kChangeMarkerMask); line >= 0;
+             line = SendMessageW(editor, kSciMarkerNext, line + 1, kChangeMarkerMask))
+            document->changed_lines.push_back(static_cast<int>(line));
+    }
+
+    void MarkTouchedLine(DocumentState& document, LRESULT line) {
+        // 防止同一行每次输入都分配一个 marker handle；大量修改的完整标记由原生
+        // change-history 绘制，跨标签锚点另设预算，避免额外内存随编辑次数无界增长。
+        if (document.touched_mark_count < 16384 &&
+            (SendMessageW(editor, 2046 /* SCI_MARKERGET */, line, 0) &
+             (1U << kRestoredChangeMarker)) == 0) {
+            if (SendMessageW(editor, kSciMarkerAdd, line, kRestoredChangeMarker) >= 0)
+                ++document.touched_mark_count;
+        }
     }
 
     void UpdateStatus() const {
@@ -1986,6 +2541,8 @@ struct EditorPage::Impl {
     }
 
     void LoadActiveDocument() {
+        pending_wrap_viewport.reset();
+        find_bar_top.reset();
         last_search_document.reset();
         find_bar.Status(L"");
         if (!ActiveDocument() && find_bar.visible())
@@ -2013,6 +2570,7 @@ struct EditorPage::Impl {
             if (scintilla_available) {
                 ShowWindow(preview, SW_HIDE);
                 ShowWindow(editor, SW_SHOW);
+                SendMessageW(editor, kSciSetChangeHistory, 0, 0);
                 SendMessageW(editor, kSciSetReadOnly, FALSE, 0);
                 SendMessageA(editor, kSciSetText, 0, reinterpret_cast<LPARAM>(""));
                 SendMessageW(editor, kSciSetScrollWidth, 1, 0);
@@ -2063,7 +2621,20 @@ struct EditorPage::Impl {
                 UpdateLineNumberMargin();
                 ScheduleHorizontalScrollbarUpdate();
                 ConfigureLexer(*document);
+                SendMessageW(editor, 2075 /* SCI_EMPTYUNDOBUFFER */, 0, 0);
                 SendMessageW(editor, kSciSetSavePoint, 0, 0);
+                document->trusted_savepoint = !document->dirty;
+                if (!document->dirty)
+                    document->saved_encoding = document->encoding;
+                SendMessageW(editor,
+                             kSciSetChangeHistory,
+                             document->kind == EditorDocumentKind::Text && !document->read_only ? 3
+                                                                                                : 0,
+                             0);
+                SendMessageW(editor, kSciMarkerDeleteAll, kRestoredChangeMarker, 0);
+                document->touched_mark_count = document->changed_lines.size();
+                for (const int line : document->changed_lines)
+                    SendMessageW(editor, kSciMarkerAdd, line, kRestoredChangeMarker);
                 SendMessageW(editor,
                              kSciSetReadOnly,
                              document->kind == EditorDocumentKind::Text && !document->read_only &&
@@ -2188,6 +2759,12 @@ struct EditorPage::Impl {
             return false;
         }
         switch (id) {
+        case kChangesId:
+            if (const auto* document = ActiveDocument();
+                document && document->dirty && document->kind == EditorDocumentKind::Text &&
+                !document->read_only && !document->closing && !document->saving)
+                InvokeSafely(changes_requested, document->id);
+            return true;
         case kPathRefreshId:
             NavigateFromPath();
             return true;
@@ -2250,6 +2827,13 @@ struct EditorPage::Impl {
                 document->dirty = true;
                 if (batch_replacing)
                     return false;
+                // 原生 change-history 标记按绘制实时生成，不属于 MARKERNEXT 的集合。
+                // 另存少量真实“触及行”锚点供标签切换恢复；精确改动仍以原版本对比为准。
+                const auto first =
+                    SendMessageW(editor, kSciLineFromPosition, notification.position, 0);
+                const auto added = std::clamp<std::intptr_t>(notification.lines_added, 0, 1024);
+                for (std::intptr_t offset = 0; offset <= added; ++offset)
+                    MarkTouchedLine(*document, first + offset);
                 UpdateLineNumberMargin();
                 UpdateScrollWidthForCurrentLine();
                 // SCI_SETSCROLLWIDTHTRACKING updates the measured width after
@@ -2271,6 +2855,14 @@ struct EditorPage::Impl {
             if (header.code == kScnSavePointReached && !document->saving) {
                 if (batch_replacing)
                     return false;
+                if (document->trusted_savepoint && document->encoding == document->saved_encoding) {
+                    document->dirty = false;
+                    document->changed_lines.clear();
+                    document->touched_mark_count = 0;
+                    SendMessageW(editor, kSciMarkerDeleteAll, kRestoredChangeMarker, 0);
+                    InvokeSafely(document_changed, document->id);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
                 UpdateStatus();
                 return false;
             }
@@ -2371,7 +2963,7 @@ struct EditorPage::Impl {
         GetClientRect(hwnd, &client);
         const UINT dpi = detail::WindowDpi(hwnd);
         const int thickness = std::max(1, detail::ScaleForDpi(2, dpi));
-        const int gap = detail::ScaleForDpi(6, dpi);
+        const int gap = detail::ScaleForDpi(2, dpi);
         int x{};
         int y{};
         int width{};
@@ -2411,7 +3003,7 @@ struct EditorPage::Impl {
             const int maximum = std::max(minimum, available / 2);
             const int next_value = std::clamp(
                 resize_start + static_cast<int>(point.x - resize_origin.x), minimum, maximum);
-            const int gap = detail::ScaleForDpi(6, dpi);
+            const int gap = detail::ScaleForDpi(2, dpi);
             const int next_position = next_value + gap / 2;
             if (next_position != resize_preview_position) {
                 resize_preview_value = next_value;
@@ -2473,7 +3065,7 @@ struct EditorPage::Impl {
         int pad{}, gap{}, row{}, button{}, left_width{}, right_x{}, right_width{};
         int header_height{}, path_height{}, path_top{}, editor_y{}, editor_height{};
         int status_y{}, status_height{}, conflict_height{}, conflict_y{};
-        RECT save{}, owner{}, details{}, encoding{};
+        RECT save{}, changes{}, owner{}, details{}, encoding{};
     };
 
     PageMetrics Measure(const int width, const int height) {
@@ -2491,7 +3083,7 @@ struct EditorPage::Impl {
         m.left_width =
             std::clamp(left_width_override > 0 ? left_width_override : px(232), min_left, max_left);
         left_width_override = m.left_width;
-        m.right_x = m.left_width + m.gap;
+        m.right_x = m.left_width + px(2);
         m.right_width = std::max(0, width - m.right_x - px(8));
         m.header_height = px(34);
         m.path_height = px(28);
@@ -2513,6 +3105,10 @@ struct EditorPage::Impl {
         m.conflict_y = m.status_y + m.status_height + px(6);
         const int right = m.right_x + m.right_width;
         m.save = {std::max(m.right_x, right - m.button), px(3), right, px(31)};
+        m.changes = {std::max<LONG>(m.right_x, m.save.left - px(60)),
+                     px(3),
+                     std::max<LONG>(m.right_x, m.save.left - px(4)),
+                     px(31)};
         const auto* document = ActiveDocument();
         const bool editable =
             document && document->kind == EditorDocumentKind::Text && !document->read_only;
@@ -2609,7 +3205,7 @@ struct EditorPage::Impl {
         const int tab_y = 0;
         const float strip_height = 34.0F * scale;
         const int tab_room =
-            std::max(1, static_cast<int>(m.save.left) - right_x - detail::ScaleForDpi(12, dpi));
+            std::max(1, static_cast<int>(m.changes.left) - right_x - detail::ScaleForDpi(12, dpi));
         const int arrow = std::min(detail::ScaleForDpi(20, dpi), tab_room / 4);
         auto viewport = ComputeTerminalTabViewport(
             tab_room,
@@ -2707,6 +3303,16 @@ struct EditorPage::Impl {
                                               static_cast<float>(right_x + right_width),
                                               static_cast<float>(m.status_y + 1))});
         const auto* current = ActiveDocument();
+        surface.Add({.id = kChangesId,
+                     .role = detail::UiRole::ghost_button,
+                     .bounds = detail::UiRect(static_cast<float>(m.changes.left),
+                                              static_cast<float>(m.changes.top),
+                                              static_cast<float>(m.changes.right),
+                                              static_cast<float>(m.changes.bottom)),
+                     .text = L"改动",
+                     .alignment = detail::UiTextAlign::center,
+                     .enabled = current && current->dirty && !current->read_only &&
+                                !current->closing && !current->saving});
         surface.Add({
             .id = kSaveId,
             .role = current && current->dirty ? detail::UiRole::primary_button
@@ -2816,7 +3422,7 @@ struct EditorPage::Impl {
         RECT client{};
         GetClientRect(hwnd, &client);
         const UINT dpi = detail::WindowDpi(hwnd);
-        const int right_x = left_splitter_x + detail::ScaleForDpi(3, dpi);
+        const int right_x = left_splitter_x + detail::ScaleForDpi(2, dpi) / 2;
         const RECT strip{right_x, 0, client.right, detail::ScaleForDpi(35, dpi)};
         InvalidateRect(hwnd, &strip, FALSE);
     }
@@ -2893,12 +3499,12 @@ struct EditorPage::Impl {
         const int left_width = m.left_width;
         const int file_left = 0;
         const int right_x = m.right_x, right_width = m.right_width;
-        left_splitter_x = file_left + left_width + gap / 2;
+        left_splitter_x = file_left + left_width + (right_x - left_width) / 2;
 
         const int path_height = m.path_height;
         const int file_x = file_left + pad;
-        const int file_width = std::max(1, left_width - pad * 2);
-        const int path_width = std::max(1, file_width - detail::ScaleForDpi(32, dpi));
+        const int file_width = std::max(1, left_width - pad - detail::ScaleForDpi(4, dpi));
+        const int path_width = std::max(1, left_width - pad * 2 - detail::ScaleForDpi(32, dpi));
         const int path_top = m.path_top;
         MoveWindow(path_frame, file_x, path_top, path_width, path_height, TRUE);
         if (path_frame_region.cx != path_width || path_frame_region.cy != path_height) {
@@ -2927,7 +3533,12 @@ struct EditorPage::Impl {
             file_column_width = file_width;
         }
 
-        MoveWindow(editor, right_x, m.editor_y, right_width, m.editor_height, TRUE);
+        MoveWindow(editor,
+                   right_x,
+                   m.editor_y,
+                   right_width,
+                   m.editor_height,
+                   pending_wrap_viewport ? FALSE : TRUE);
         UpdateHorizontalScrollbar();
         MoveWindow(preview, right_x, m.editor_y, right_width, m.editor_height, TRUE);
         const auto place = [](HWND control, RECT bounds) {
@@ -2942,6 +3553,12 @@ struct EditorPage::Impl {
         place(status_details, m.details);
         place(encoding_selector, m.encoding);
         PlaceFindBar();
+
+        if (pending_wrap_viewport) {
+            RestoreWrapViewport();
+            if (pending_wrap_viewport)
+                ScheduleHorizontalScrollbarUpdate();
+        }
 
         if (conflict_visible) {
             conflict_splitter_y = m.conflict_y - gap / 2;
@@ -3003,6 +3620,8 @@ bool EditorPage::Create(HWND parent, HINSTANCE instance) {
     impl_->find_bar.action = [self = impl_.get()](detail::FindBar::Action action) {
         if (action == detail::FindBar::Action::Changed ||
             action == detail::FindBar::Action::Closed) {
+            if (action == detail::FindBar::Action::Closed)
+                self->find_bar_top.reset();
             self->PlaceFindBar();
             if (action == detail::FindBar::Action::Closed)
                 InvalidateRect(self->editor, nullptr, FALSE);
@@ -3263,10 +3882,13 @@ void EditorPage::Show(bool visible) {
     }
     ShowWindow(impl_->hwnd, SW_SHOWNOACTIVATE);
     SetWindowPos(impl_->hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    const bool restoring = impl_->pending_wrap_viewport.has_value();
+    if (restoring)
+        impl_->ScheduleHorizontalScrollbarUpdate();
     RedrawWindow(impl_->hwnd,
                  nullptr,
                  nullptr,
-                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | (restoring ? 0 : RDW_UPDATENOW));
 }
 
 void EditorPage::ShowFindBar(bool replace) {
@@ -3297,14 +3919,19 @@ void EditorPage::ApplyTheme() {
 }
 
 void EditorPage::SetWordWrap(bool enabled) {
-    if (std::exchange(impl_->word_wrap, enabled) == enabled || !impl_->editor ||
-        !impl_->scintilla_available)
+    if (impl_->word_wrap == enabled)
+        return;
+    impl_->CaptureWrapViewport();
+    impl_->word_wrap = enabled;
+    if (!impl_->editor || !impl_->scintilla_available)
         return;
     SendMessageW(impl_->editor, kSciSetWrapMode, enabled ? 1 : 0, 0);
     if (enabled)
         SendMessageW(impl_->editor, kSciSetXOffset, 0, 0);
-    // 先让控件完成折行，再读取显示行数量更新滚动条，不重载或复制正文。
-    RedrawWindow(impl_->editor, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    // 设置页操作时编辑控件是隐藏的，不能把未完成折行的几何当成最终结果。
+    // 可见时立即恢复，隐藏时保留锚点，到页面重新显示后的消息轮次再应用。
+    impl_->RestoreWrapViewport();
+    impl_->ScheduleHorizontalScrollbarUpdate();
     impl_->UpdateEditorScrollbarWindows();
 }
 
@@ -3448,6 +4075,8 @@ EditorDocumentId EditorPage::OpenDocument(EditorDocumentDescriptor document) {
         existing->read_only =
             document.read_only || document.kind == EditorDocumentKind::ReadOnlyLarge;
         existing->dirty = document.dirty;
+        existing->changed_lines.clear();
+        existing->touched_mark_count = 0;
         existing->preview = document.kind == EditorDocumentKind::ReadOnlyLarge
                                 ? Utf8ToWide(existing->content)
                                 : std::wstring{};
@@ -3634,6 +4263,12 @@ void EditorPage::MarkDocumentSaved(EditorDocumentId id) {
     }
     document->dirty = false;
     document->saving = false;
+    document->trusted_savepoint = true;
+    document->saved_encoding = document->encoding;
+    document->changed_lines.clear();
+    document->touched_mark_count = 0;
+    if (impl_->active_id == id)
+        SendMessageW(impl_->editor, kSciMarkerDeleteAll, kRestoredChangeMarker, 0);
     document->conflict.clear();
     if (impl_->active_id && *impl_->active_id == id && impl_->encoding_selector) {
         EnableWindow(impl_->encoding_selector, true);
@@ -3661,6 +4296,16 @@ void EditorPage::SetDocumentLocation(EditorDocumentId id,
 bool EditorPage::DocumentDirty(EditorDocumentId id) const noexcept {
     const auto* document = impl_->FindDocument(id);
     return document && document->dirty;
+}
+
+void EditorPage::SetDocumentDirty(EditorDocumentId id, bool dirty) {
+    if (!dirty) {
+        MarkDocumentSaved(id);
+    } else if (auto* document = impl_->FindDocument(id)) {
+        document->dirty = true;
+        impl_->UpdateStatus();
+        InvalidateRect(impl_->hwnd, nullptr, FALSE);
+    }
 }
 
 void EditorPage::SetDocumentConflict(EditorDocumentId id, std::wstring message) {
@@ -3737,6 +4382,57 @@ void EditorPage::SetSaveAsRequestedCallback(SaveRequestCallback callback) {
 
 void EditorPage::SetDiffRequestedCallback(DocumentActionCallback callback) {
     impl_->diff_requested = std::move(callback);
+}
+
+void EditorPage::SetChangesRequestedCallback(DocumentActionCallback callback) {
+    impl_->changes_requested = std::move(callback);
+}
+
+void EditorPage::RequestChanges() {
+    impl_->HandleCommand(kChangesId, BN_CLICKED);
+}
+
+HWND EditorPage::ShowChangesView(std::wstring title, std::string report) {
+    WNDCLASSW wc{};
+    wc.hInstance = impl_->instance;
+    wc.lpfnWndProc = ChangesViewProc;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = kChangesViewClass;
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return nullptr;
+    auto state = std::make_unique<ChangesViewContext>();
+    state->module = LoadLibraryW((detail::ExecutableDirectory() / L"Scintilla.dll").c_str());
+    if (!state->module)
+        return nullptr;
+    state->report = std::move(report);
+    const auto owner = GetAncestor(impl_->hwnd, GA_ROOT);
+    const auto view = CreateWindowExW(WS_EX_TOOLWINDOW,
+                                      kChangesViewClass,
+                                      title.c_str(),
+                                      WS_OVERLAPPEDWINDOW,
+                                      CW_USEDEFAULT,
+                                      CW_USEDEFAULT,
+                                      detail::ScaleForDpi(850, detail::WindowDpi(owner)),
+                                      detail::ScaleForDpi(600, detail::WindowDpi(owner)),
+                                      owner,
+                                      nullptr,
+                                      impl_->instance,
+                                      state.get());
+    if (view) {
+        // 创建成功后才移交上下文和 DLL 引用，资源不足时不影响源文件及撤销栈。
+        state->window_owned = true;
+        state.release();
+        ShowWindow(view, SW_SHOW);
+    }
+    return view;
+}
+
+std::wstring EditorPage::DocumentDisplayName(EditorDocumentId id) const {
+    const auto* document = impl_->FindDocument(id);
+    if (!document)
+        return {};
+    return document->server_name.empty() ? document->title
+                                         : document->server_name + L" " + document->title;
 }
 
 void EditorPage::SetCloseRequestedCallback(CloseRequestCallback callback) {
