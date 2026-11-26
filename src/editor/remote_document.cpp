@@ -116,7 +116,8 @@ bool SameRevision(const RemoteRevision& revision,
            revision.content_sha256 == content_sha256;
 }
 
-ContentHash Sha256(std::span<const std::byte> bytes) {
+// 内存正文和端点流共用同一 SHA-256 实现，避免两种校验路径出现不同的摘要语义。
+template <typename Feed> ContentHash HashWithFeed(Feed&& feed) {
     BCRYPT_ALG_HANDLE algorithm{};
     if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) {
         throw std::runtime_error("Cannot initialize Windows SHA-256 provider");
@@ -157,18 +158,23 @@ ContentHash Sha256(std::span<const std::byte> bytes) {
         }
     } hash_guard{hash};
 
-    std::size_t offset{};
-    while (offset < bytes.size()) {
-        const auto count = static_cast<ULONG>((std::min)(
-            bytes.size() - offset, static_cast<std::size_t>((std::numeric_limits<ULONG>::max)())));
-        if (BCryptHashData(hash,
-                           reinterpret_cast<PUCHAR>(const_cast<std::byte*>(bytes.data() + offset)),
-                           count,
-                           0) < 0) {
-            throw std::runtime_error("Cannot update Windows SHA-256 hash");
+    const auto update = [&](std::span<const std::byte> bytes) {
+        std::size_t offset{};
+        while (offset < bytes.size()) {
+            const auto count = static_cast<ULONG>(
+                (std::min)(bytes.size() - offset,
+                           static_cast<std::size_t>((std::numeric_limits<ULONG>::max)())));
+            if (BCryptHashData(
+                    hash,
+                    reinterpret_cast<PUCHAR>(const_cast<std::byte*>(bytes.data() + offset)),
+                    count,
+                    0) < 0) {
+                throw std::runtime_error("Cannot update Windows SHA-256 hash");
+            }
+            offset += count;
         }
-        offset += count;
-    }
+    };
+    feed(update);
     ContentHash result{};
     if (BCryptFinishHash(
             hash, reinterpret_cast<PUCHAR>(result.data()), static_cast<ULONG>(result.size()), 0) <
@@ -176,6 +182,12 @@ ContentHash Sha256(std::span<const std::byte> bytes) {
         throw std::runtime_error("Cannot finish Windows SHA-256 hash");
     }
     return result;
+}
+
+ContentHash Sha256(std::span<const std::byte> bytes) {
+    return HashWithFeed([bytes](const auto& update) {
+        update(bytes);
+    });
 }
 
 ContentHash Sha256(std::string_view text) {
@@ -401,6 +413,37 @@ std::filesystem::path CommittedContentPath(const std::filesystem::path& metadata
     auto original = metadata_path;
     original.replace_extension(L".content");
     return std::filesystem::exists(original) ? original : path;
+}
+
+// 保存校验只需要摘要，固定 64 KiB 缓冲，不再累积整份远端文件。
+// 保留完整读取与大小上限：不能用元数据或局部抽样替代冲突保护。
+EditorResult<ContentHash>
+HashEndpoint(IFileEndpoint& endpoint, const FileUri& uri, std::uint64_t maximum) {
+    struct TooLarge {};
+    try {
+        auto stream = endpoint.open_read(uri);
+        std::array<std::byte, 64 * 1024> buffer{};
+        std::uint64_t total{};
+        auto hash = HashWithFeed([&](const auto& update) {
+            for (;;) {
+                const auto count = stream->read(buffer);
+                if (count == 0)
+                    break;
+                if (count > buffer.size())
+                    throw std::runtime_error("Endpoint returned an invalid read size");
+                if (count > maximum - total)
+                    throw TooLarge{};
+                total += count;
+                update(std::span<const std::byte>(buffer.data(), count));
+            }
+        });
+        return EditorResult<ContentHash>::Success(hash);
+    } catch (const TooLarge&) {
+        return EditorResult<ContentHash>::Failure(
+            EditorStatus::Error(EditorErrc::Unsupported, "Remote file exceeds editor limit"));
+    } catch (const std::exception& error) {
+        return EditorResult<ContentHash>::Failure(IoError(error.what()));
+    }
 }
 
 EditorResult<std::vector<std::byte>>
@@ -852,12 +895,12 @@ EditorResult<SaveResult> RemoteDocument::Save(const SaveMode mode) {
     if (mode == SaveMode::CheckForConflict && remote_stat) {
         bool same_revision = false;
         if (remote_stat->size <= RemoteEditorService::kEditableSizeLimit) {
-            auto bytes =
-                ReadEndpoint(*impl_->endpoint, impl_->uri, RemoteEditorService::kEditableSizeLimit);
-            if (!bytes) {
-                return EditorResult<SaveResult>::Failure(bytes.status());
+            auto hash =
+                HashEndpoint(*impl_->endpoint, impl_->uri, RemoteEditorService::kEditableSizeLimit);
+            if (!hash) {
+                return EditorResult<SaveResult>::Failure(hash.status());
             }
-            same_revision = SameRevision(impl_->base_revision, *remote_stat, Sha256(bytes.value()));
+            same_revision = SameRevision(impl_->base_revision, *remote_stat, hash.value());
         }
         if (!same_revision) {
             auto conflict = CaptureConflict(
@@ -887,6 +930,31 @@ EditorResult<SaveResult> RemoteDocument::Save(const SaveMode mode) {
         output.reset();
         if (impl_->base_revision.permissions != 0) {
             impl_->endpoint->set_permissions(temporary, impl_->base_revision.permissions);
+        }
+        if (mode == SaveMode::CheckForConflict) {
+            // 上传可能耗时数秒：初检通过不表示原文件在最终替换时仍未变化。
+            // 仅丢弃本次临时文件，保留外部新版本与本地 dirty/恢复缓存。
+            std::optional<FileStat> latest;
+            if (impl_->endpoint->exists(impl_->uri))
+                latest = impl_->endpoint->stat(impl_->uri);
+            bool unchanged = false;
+            if (latest && latest->kind == FileKind::Regular &&
+                latest->size <= RemoteEditorService::kEditableSizeLimit) {
+                auto current = HashEndpoint(
+                    *impl_->endpoint, impl_->uri, RemoteEditorService::kEditableSizeLimit);
+                if (!current)
+                    throw std::runtime_error(current.status().message);
+                unchanged = SameRevision(impl_->base_revision, *latest, current.value());
+            }
+            if (!unchanged) {
+                auto conflict = CaptureConflict(
+                    *impl_->endpoint, impl_->uri, impl_->text, latest, impl_->encoding);
+                impl_->endpoint->remove(temporary, false);
+                if (!conflict)
+                    return EditorResult<SaveResult>::Failure(conflict.status());
+                return EditorResult<SaveResult>::Success(
+                    {SaveOutcome::Conflict, std::move(conflict).value()});
+            }
         }
         impl_->endpoint->rename(temporary, impl_->uri, true);
         impl_->base_revision = ToRevision(impl_->endpoint->stat(impl_->uri), Sha256(bytes));

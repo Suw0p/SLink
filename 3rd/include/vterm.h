@@ -437,6 +437,8 @@ typedef struct {
   int (*resize)(int rows, int cols, VTermStateFields *fields, void *user);
   int (*setlineinfo)(int row, const VTermLineInfo *newinfo, const VTermLineInfo *oldinfo, void *user);
   int (*sb_clear)(void *user);
+  /* SLink: capture outgoing line metadata before scroll mutates lineinfo. */
+  int (*sb_pushline_info)(int row, const VTermLineInfo *info, int wrapped, void *user);
 } VTermStateCallbacks;
 
 typedef struct {
@@ -541,6 +543,9 @@ typedef struct {
   int (*sb_pushline)(int cols, const VTermScreenCell *cells, void *user);
   int (*sb_popline)(int cols, VTermScreenCell *cells, void *user);
   int (*sb_clear)(void* user);
+  /* Optional SLink extension; replaces sb_pushline when supplied. */
+  int (*sb_pushline_info)(int cols, const VTermScreenCell *cells,
+                        int continuation, int wrapped, void *user);
 } VTermScreenCallbacks;
 
 VTermScreen *vterm_obtain_screen(VTerm *vt);

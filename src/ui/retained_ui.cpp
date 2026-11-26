@@ -48,6 +48,7 @@ bool Interactive(UiRole role) {
     case UiRole::primary_button:
     case UiRole::ghost_button:
     case UiRole::icon_button:
+    case UiRole::search_button:
     case UiRole::toggle:
     case UiRole::window_button:
     case UiRole::window_close_button:
@@ -387,6 +388,21 @@ void UiSurface::DrawElement(const UiElement& element) {
         border_width = 1.0F;
         radius = std::max(1.0F, Height(element.bounds) / 2.0F);
         break;
+    case UiRole::search_button:
+        fill = element.selected ? kAccentSoft
+                                : (pressed || hovered ? kPanelHover : D2D1::ColorF(0, 0.0F));
+        border = element.selected ? kAccent : kBorder;
+        border_width = element.selected ? 1.0F : 0.0F;
+        text_color = element.selected || hovered ? kTextStrong : kMuted;
+        radius = 4.0F;
+        break;
+    case UiRole::input_field:
+        fill = UiColor(kWindowColor);
+        border = element.error ? D2D1::ColorF(theme::IsDark() ? 0xd47b72 : 0xb4473e)
+                               : (element.selected ? kAccent : kBorder);
+        border_width = 1.0F;
+        radius = 5.0F;
+        break;
     case UiRole::window_button:
         fill = pressed ? kPanelRaised : (hovered ? kPanelHover : D2D1::ColorF(0, 0.0F));
         text_color = hovered ? kTextStrong : kMuted;
@@ -456,9 +472,16 @@ void UiSurface::DrawElement(const UiElement& element) {
     }
 
     D2D1_RECT_F content = element.bounds;
-    const float padding = 10.0F;
+    const bool compact_button =
+        element.role == UiRole::search_button ||
+        (element.role == UiRole::icon_button && element.alignment == UiTextAlign::center);
+    const float padding = compact_button ? 3.0F : 10.0F;
     if (element.icon != UiIcon::none) {
-        const float icon_size = std::min(16.0F, std::max(10.0F, Height(content) - 14.0F));
+        const float icon_size =
+            element.role == UiRole::search_button
+                ? std::min(16.0F * dpi_ / 96.0F,
+                           std::max(10.0F, Height(content) - 8.0F * dpi_ / 96.0F))
+                : std::min(16.0F, std::max(10.0F, Height(content) - 14.0F));
         D2D1_RECT_F icon_rect{};
         if (element.alignment == UiTextAlign::center && element.text.empty()) {
             icon_rect = UiRect(content.left + (Width(content) - icon_size) / 2.0F,
@@ -491,7 +514,8 @@ void UiSurface::DrawText(const UiElement& element, D2D1_RECT_F bounds, ID2D1Brus
                element.role == UiRole::primary_button) {
         format = element.role == UiRole::file_tab && element.compact_text ? compact_tab_format_
                                                                           : semibold_format_;
-    } else if (element.role == UiRole::muted || element.role == UiRole::status) {
+    } else if (element.role == UiRole::muted || element.role == UiRole::status ||
+               element.role == UiRole::search_button) {
         format = caption_format_;
     }
     switch (element.alignment) {
@@ -526,6 +550,46 @@ void UiSurface::DrawIcon(const UiIcon icon, const D2D1_RECT_F bounds, ID2D1Brush
     };
 
     switch (icon) {
+    case UiIcon::replace_one:
+    case UiIcon::replace_all: {
+        // “源文字 → 目标文字”与叠页区分单次/全部替换。使用归一化矢量，
+        // 不依赖系统图标字体，并在高 DPI 下保持同样的笔画比例。
+        D2D1_MATRIX_3X2_F previous{};
+        target_->GetTransform(&previous);
+        target_->SetTransform(
+            D2D1::Matrix3x2F::Scale(Width(bounds) / 16.0F, Height(bounds) / 16.0F) *
+            D2D1::Matrix3x2F::Translation(left, top) * previous);
+        const auto segment = [&](float x1, float y1, float x2, float y2) {
+            target_->DrawLine(D2D1::Point2F(x1, y1), D2D1::Point2F(x2, y2), brush, 1.0F);
+        };
+        // 右上角 a，左侧折向目标的箭头。
+        target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(12.0F, 4.5F), 2.0F, 2.0F), brush, 1.0F);
+        segment(14.0F, 2.5F, 14.0F, 6.5F);
+        segment(7.5F, 2.5F, 3.5F, 2.5F);
+        segment(3.5F, 2.5F, 3.5F, 7.0F);
+        segment(1.5F, 5.0F, 3.5F, 7.0F);
+        segment(3.5F, 7.0F, 5.5F, 5.0F);
+        const bool all = icon == UiIcon::replace_all;
+        if (all) {
+            segment(4.0F, 8.5F, 13.5F, 8.5F);
+            segment(13.5F, 8.5F, 13.5F, 13.5F);
+        }
+        target_->DrawRoundedRectangle(
+            D2D1::RoundedRect(UiRect(1.5F, 10.0F, all ? 11.5F : 8.5F, 15.5F), 0.5F, 0.5F),
+            brush,
+            1.0F);
+        // 框内 b；全部替换额外带一个目标文字，缩小后仍可区分。
+        const auto letter_b = [&](float x) {
+            segment(x, 11.0F, x, 14.5F);
+            target_->DrawEllipse(
+                D2D1::Ellipse(D2D1::Point2F(x + 1.0F, 13.4F), 1.0F, 1.1F), brush, 0.8F);
+        };
+        letter_b(3.5F);
+        if (all)
+            letter_b(7.5F);
+        target_->SetTransform(previous);
+        break;
+    }
     case UiIcon::terminal:
         target_->DrawRoundedRectangle(D2D1::RoundedRect(bounds, 2.0F, 2.0F), brush, stroke);
         line(left + 3.0F, top + 4.0F, left + 6.0F, cy);
@@ -598,13 +662,6 @@ void UiSurface::DrawIcon(const UiIcon icon, const D2D1_RECT_F bounds, ID2D1Brush
         line(left + 1.0F, top + 4.0F, left + 6.0F, top + 4.0F);
         line(left + 2.0F, top + 2.0F, left + 6.0F, top + 2.0F);
         line(left + 6.0F, top + 2.0F, left + 8.0F, top + 4.0F);
-        break;
-    case UiIcon::refresh:
-        line(cx - 5.0F, cy - 3.0F, cx - 5.0F, cy - 6.0F);
-        line(cx - 5.0F, cy - 6.0F, cx - 2.0F, cy - 6.0F);
-        line(cx + 5.0F, cy + 3.0F, cx + 5.0F, cy + 6.0F);
-        line(cx + 5.0F, cy + 6.0F, cx + 2.0F, cy + 6.0F);
-        target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 5.0F, 5.0F), brush, stroke);
         break;
     case UiIcon::minimize:
         line(left + 3.0F, cy, right - 3.0F, cy);
@@ -702,8 +759,14 @@ void UiSurface::CancelPointer() {
 }
 
 TabDragVisual::~TabDragVisual() {
+    Destroy();
+}
+
+void TabDragVisual::Destroy() noexcept {
     if (window_ && IsWindow(window_))
         DestroyWindow(window_);
+    window_ = nullptr;
+    owner_ = nullptr;
 }
 
 LRESULT CALLBACK TabDragVisual::WindowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {

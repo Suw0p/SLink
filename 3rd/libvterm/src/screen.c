@@ -205,25 +205,38 @@ static int putglyph(VTermGlyphInfo *info, VTermPos pos, void *user)
   return 1;
 }
 
-static void sb_pushline_from_row(VTermScreen *screen, int row)
+static void sb_pushline_from_row(VTermScreen *screen, int row, const VTermLineInfo *info, int wrapped)
 {
   VTermPos pos = { .row = row };
   for(pos.col = 0; pos.col < screen->cols; pos.col++)
     vterm_screen_get_cell(screen, pos, screen->sb_buffer + pos.col);
 
-  (screen->callbacks->sb_pushline)(screen->cols, screen->sb_buffer, screen->cbdata);
+  if(screen->callbacks->sb_pushline_info)
+    (screen->callbacks->sb_pushline_info)(screen->cols, screen->sb_buffer,
+      info ? info->continuation : 0, wrapped, screen->cbdata);
+  else if(screen->callbacks->sb_pushline)
+    (screen->callbacks->sb_pushline)(screen->cols, screen->sb_buffer, screen->cbdata);
+}
+
+static int prescroll_line(int row, const VTermLineInfo *info, int wrapped, void *user)
+{
+  VTermScreen *screen = user;
+  if(screen->callbacks && screen->callbacks->sb_pushline_info &&
+     screen->buffer == screen->buffers[BUFIDX_PRIMARY])
+    sb_pushline_from_row(screen, row, info, wrapped);
+  return 1;
 }
 
 static int moverect_internal(VTermRect dest, VTermRect src, void *user)
 {
   VTermScreen *screen = user;
 
-  if(screen->callbacks && screen->callbacks->sb_pushline &&
+  if(screen->callbacks && screen->callbacks->sb_pushline && !screen->callbacks->sb_pushline_info &&
      dest.start_row == 0 && dest.start_col == 0 &&        // starts top-left corner
      dest.end_col == screen->cols &&                      // full width
      screen->buffer == screen->buffers[BUFIDX_PRIMARY]) { // not altscreen
     for(int row = 0; row < src.start_row; row++)
-      sb_pushline_from_row(screen, row);
+      sb_pushline_from_row(screen, row, NULL, 0);
   }
 
   int cols = src.end_col - src.start_col;
@@ -671,9 +684,10 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
 
   if(old_row >= 0 && bufidx == BUFIDX_PRIMARY) {
     /* Push spare lines to scrollback buffer */
-    if(screen->callbacks && screen->callbacks->sb_pushline)
+    if(screen->callbacks && (screen->callbacks->sb_pushline || screen->callbacks->sb_pushline_info))
       for(int row = 0; row <= old_row; row++)
-        sb_pushline_from_row(screen, row);
+        sb_pushline_from_row(screen, row, old_lineinfo ? &old_lineinfo[row] : NULL,
+          old_lineinfo && row + 1 < old_rows && old_lineinfo[row + 1].continuation);
     if(active)
       statefields->pos.row -= (old_row + 1);
   }
@@ -852,6 +866,7 @@ static VTermStateCallbacks state_cbs = {
   .resize      = &resize,
   .setlineinfo = &setlineinfo,
   .sb_clear    = &sb_clear,
+  .sb_pushline_info = &prescroll_line,
 };
 
 static VTermScreen *screen_new(VTerm *vt)

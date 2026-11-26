@@ -128,6 +128,12 @@ static void scroll(VTermState *state, VTermRect rect, int downward, int rightwar
 
   // Update lineinfo if full line
   if(rect.start_col == 0 && rect.end_col == state->cols && rightward == 0) {
+    /* SLink: the screen cells and lineinfo still refer to the same old rows here. */
+    if(rect.start_row == 0 && downward > 0 && state->callbacks && state->callbacks->sb_pushline_info) {
+      for(int row = 0; row < downward; row++)
+        (*state->callbacks->sb_pushline_info)(row, &state->lineinfo[row],
+          row + 1 < state->rows && state->lineinfo[row + 1].continuation, state->cbdata);
+    }
     int height = rect.end_row - rect.start_row - abs(downward);
 
     if(downward > 0) {

@@ -557,7 +557,7 @@ struct TransferPage::Impl {
     bool split_active{};
     bool tab_drag_armed{};
     bool tab_dragging{};
-    int dragged_tab{-1};
+    TransferPaneId dragged_pane_id{};
     POINT tab_drag_origin{};
     detail::TabDragVisual tab_drag_visual;
     std::array<int, 6> drag_surface_geometry{};
@@ -642,6 +642,22 @@ struct TransferPage::Impl {
         }
 
         switch (message) {
+        case WM_GETDLGCODE:
+            if (self->tab_drag_armed || self->tab_dragging)
+                return DLGC_WANTALLKEYS;
+            break;
+        case WM_KEYDOWN:
+            if (self->tab_drag_armed || self->tab_dragging) {
+                if (wparam == VK_ESCAPE)
+                    self->CancelTabDrag(true);
+                return 0;
+            }
+            break;
+        case WM_CHAR:
+        case WM_SYSCHAR:
+            if (self->tab_drag_armed || self->tab_dragging)
+                return 0;
+            break;
         case WM_SIZE:
             self->CancelInlineEdit();
             self->ScheduleLayout(LOWORD(lparam), HIWORD(lparam));
@@ -709,7 +725,7 @@ struct TransferPage::Impl {
             self->HandlePointerUp({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
             return 0;
         case WM_CANCELMODE:
-            self->CancelTabDrag();
+            self->CancelTabDrag(true);
             return 0;
         case WM_CAPTURECHANGED:
             if (self->resize_mode != ResizeMode::none) {
@@ -724,7 +740,7 @@ struct TransferPage::Impl {
             self->resize_preview_position = -1;
             self->resize_mode = ResizeMode::none;
             self->resize_start_weights.clear();
-            self->CancelTabDrag();
+            self->CancelTabDrag(true);
             self->surface.CancelPointer();
             return 0;
         case WM_SETCURSOR:
@@ -1042,6 +1058,10 @@ struct TransferPage::Impl {
     }
 
     void OnWindowDestroyed(HWND window) {
+        tab_drag_visual.Destroy();
+        const HWND guide = std::exchange(resize_guide, nullptr);
+        if (guide && IsWindow(guide))
+            DestroyWindow(guide);
         shell_drag.Shutdown();
         KillTimer(window, kQueueTimerId);
         KillTimer(window, kLayoutTimerId);
@@ -1076,6 +1096,15 @@ struct TransferPage::Impl {
             return pane.id == id;
         });
         return it == panes.end() ? nullptr : &*it;
+    }
+
+    std::optional<std::size_t> TabIndexForId(TransferPaneId id) const noexcept {
+        if (id == 0)
+            return std::nullopt;
+        const auto found = std::ranges::find(panes, id, &Pane::id);
+        return found == panes.end()
+                   ? std::nullopt
+                   : std::optional<std::size_t>(static_cast<std::size_t>(found - panes.begin()));
     }
 
     unsigned GroupOf(const std::size_t index) const noexcept {
@@ -1312,19 +1341,18 @@ struct TransferPage::Impl {
     }
 
     SplitDropZone DropZoneAt(const POINT point, const int source_tab = -1) const noexcept {
-        const int source = source_tab >= 0 ? source_tab : dragged_tab;
+        const auto source = source_tab >= 0 ? std::optional<std::size_t>(source_tab)
+                                            : TabIndexForId(dragged_pane_id);
         if (const auto strip = TabStripAt(point))
-            return split_active && source >= 0 &&
-                           GroupOf(*strip) != GroupOf(static_cast<std::size_t>(source))
+            return split_active && source && GroupOf(*strip) != GroupOf(*source)
                        ? SplitDropZone::center
                        : SplitDropZone::none;
         const auto target = PaneAt(point);
         if (!target)
             return SplitDropZone::none;
         if (split_active)
-            return source >= 0 && GroupOf(*target) != GroupOf(static_cast<std::size_t>(source))
-                       ? SplitDropZone::center
-                       : SplitDropZone::none;
+            return source && GroupOf(*target) != GroupOf(*source) ? SplitDropZone::center
+                                                                  : SplitDropZone::none;
         const auto& rect = pane_rects[*target];
         // 与终端保持一致：标签栏附近排序，内容区左右两侧用于分屏。
         // 中央窄缝仍可取消，不要求用户拖到窗口外缘才能触发。
@@ -1471,13 +1499,17 @@ struct TransferPage::Impl {
     bool HandlePointerDown(const POINT point) {
         const int id = ElementAt(point);
         if (id >= kPaneTabBaseId && id < kPaneTabBaseId + static_cast<int>(panes.size())) {
-            dragged_tab = id - kPaneTabBaseId;
-            FocusPaneIndex(static_cast<std::size_t>(dragged_tab));
+            const auto index = static_cast<std::size_t>(id - kPaneTabBaseId);
+            dragged_pane_id = panes[index].id;
+            FocusPaneIndex(index);
             tab_drag_origin = point;
             tab_drag_armed = true;
             tab_dragging = false;
         }
-        return surface.PointerDown(point);
+        const bool captured = surface.PointerDown(point);
+        if (tab_drag_armed)
+            SetFocus(hwnd);
+        return captured;
     }
 
     void HandlePointerMove(const POINT point, const WPARAM key_state) {
@@ -1486,19 +1518,24 @@ struct TransferPage::Impl {
         if (!tab_drag_armed || (key_state & MK_LBUTTON) == 0) {
             return;
         }
+        const auto source = TabIndexForId(dragged_pane_id);
+        if (!source) {
+            CancelTabDrag(true);
+            return;
+        }
         if (!tab_dragging && (std::abs(point.x - tab_drag_origin.x) >=
                                   detail::ScaleForDpi(6, detail::WindowDpi(hwnd)) ||
                               std::abs(point.y - tab_drag_origin.y) >=
                                   detail::ScaleForDpi(6, detail::WindowDpi(hwnd)))) {
             tab_dragging = true;
             for (const auto& element : surface.elements())
-                if (element.id == kPaneTabBaseId + dragged_tab &&
+                if (element.id == kPaneTabBaseId + static_cast<int>(*source) &&
                     element.role == detail::UiRole::file_tab) {
                     tab_drag_visual.Begin(hwnd,
                                           L"SLink.TransferTabDragPreview",
-                                          panes[dragged_tab].title,
-                                          panes[dragged_tab].local ? detail::UiIcon::folder
-                                                                   : detail::UiIcon::server,
+                                          panes[*source].title,
+                                          panes[*source].local ? detail::UiIcon::folder
+                                                               : detail::UiIcon::server,
                                           element.bounds,
                                           tab_drag_origin,
                                           point);
@@ -1509,7 +1546,7 @@ struct TransferPage::Impl {
             return;
         }
         tab_drag_visual.Move(point);
-        const auto next_insertion = TabInsertionAt(point, static_cast<std::size_t>(dragged_tab));
+        const auto next_insertion = TabInsertionAt(point, *source);
         const SplitDropZone next = next_insertion ? SplitDropZone::none : DropZoneAt(point);
         const auto next_pane = next_insertion ? std::nullopt : PaneAt(point);
         if (next != visible_drop_zone || next_pane != visible_drop_pane ||
@@ -1521,12 +1558,13 @@ struct TransferPage::Impl {
         }
     }
 
-    void CancelTabDrag() {
+    void CancelTabDrag(bool restore_focus = false) {
+        const bool had_drag = tab_drag_armed || tab_dragging;
         const bool redraw = tab_dragging || visible_tab_insertion.has_value() ||
                             visible_drop_zone != SplitDropZone::none;
         tab_drag_armed = false;
         tab_dragging = false;
-        dragged_tab = -1;
+        dragged_pane_id = 0;
         visible_drop_zone = SplitDropZone::none;
         visible_drop_pane.reset();
         visible_tab_insertion.reset();
@@ -1534,6 +1572,8 @@ struct TransferPage::Impl {
         surface.CancelPointer();
         if (redraw)
             RefreshDragHints();
+        if (restore_focus && had_drag && GetFocus() == hwnd && active_pane_index < panes.size())
+            SetFocus(panes[active_pane_index].list);
     }
 
     void RefreshDragHints() {
@@ -1548,14 +1588,15 @@ struct TransferPage::Impl {
 
     void HandlePointerUp(const POINT point) {
         const bool dragged = tab_dragging;
-        const int tab = dragged_tab;
+        const auto tab = dragged_pane_id;
         const auto clicked = surface.PointerUp(point);
-        if (dragged && tab >= 0) {
-            HandleTabDrop(static_cast<std::size_t>(tab), point);
-            CancelTabDrag();
+        if (dragged) {
+            if (const auto source = TabIndexForId(tab))
+                HandleTabDrop(*source, point);
+            CancelTabDrag(true);
             return;
         }
-        CancelTabDrag();
+        CancelTabDrag(true);
         if (clicked) {
             OnCommand(*clicked, BN_CLICKED, nullptr);
         }
@@ -3204,7 +3245,7 @@ struct TransferPage::Impl {
         pane.refresh_button =
             CreateWindowExW(0,
                             L"STATIC",
-                            L"↻",
+                            detail::kRefreshGlyph,
                             WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_CENTER | SS_CENTERIMAGE,
                             0,
                             0,
@@ -3759,6 +3800,7 @@ struct TransferPage::Impl {
                                 std::string server_id,
                                 std::string path,
                                 std::shared_ptr<transfer::IFileEndpoint> endpoint) {
+        CancelTabDrag(true);
         const TransferPaneId id = next_id++;
         transfer::FileUri location =
             transfer::FileUri::sftp(std::move(server_id), path.empty() ? "/" : std::move(path));
@@ -3783,6 +3825,7 @@ struct TransferPage::Impl {
     }
 
     TransferPaneId AppendLocal(std::wstring title) {
+        CancelTabDrag(true);
         for (std::size_t index = 0; index < panes.size(); ++index) {
             if (!panes[index].local)
                 continue;
@@ -3814,6 +3857,8 @@ struct TransferPage::Impl {
     }
 
     bool RemovePane(const TransferPaneId id) {
+        const bool restore_focus = GetFocus() == hwnd;
+        CancelTabDrag(true);
         if (inline_name_edit && inline_edit_pane_id == id) {
             CancelInlineEdit();
         }
@@ -3867,6 +3912,8 @@ struct TransferPage::Impl {
         }
         NormalizeGroups();
         Relayout();
+        if (restore_focus && active_pane_index < panes.size())
+            SetFocus(panes[active_pane_index].list);
         if (pane_closed_callback) {
             pane_closed_callback(id);
         }

@@ -147,7 +147,9 @@ RunProxy(const TcpForwardSpec& spec, std::stop_token stop, const std::function<v
         FD_ZERO(&reads);
         FD_ZERO(&writes);
         FD_ZERO(&errors);
-        FD_SET(listener.value, &reads);
+        // 满额时不再订阅监听读事件；待有连接释放后再接受积压连接，避免 select 空转。
+        if (connections.size() < kMaximumConnections)
+            FD_SET(listener.value, &reads);
 
         for (auto& connection : connections) {
             if (connection.connecting) {

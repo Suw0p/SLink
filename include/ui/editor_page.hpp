@@ -109,6 +109,9 @@ public:
     void SetBounds(int x, int y, int width, int height);
     void Show(bool visible);
     void ApplyTheme();
+    // 仅改变视觉折行，不插入换行符、不标记文档已修改，适用于当前及后续标签。
+    void SetWordWrap(bool enabled);
+    bool word_wrap() const noexcept;
     // 共享服务器侧栏切换不会改变文件模型，但会改变页面的客户区起点和宽度。
     // 主窗口提交新边界后调用此方法，立即重新布局并刷新全部自绘子控件。
     void RefreshLayout();
@@ -177,6 +180,17 @@ public:
     void SetHistoryNavigationCallback(HistoryNavigationCallback callback);
 
     void RequestSave();
+    void ShowFindBar(bool replace = false);
+    bool FindText(std::wstring_view query,
+                  bool backwards = false,
+                  bool match_case = false,
+                  bool regex = false);
+    // 只修改当前文档，不自动保存；全部替换作为一次可撤销操作。
+    std::size_t ReplaceText(std::wstring_view query,
+                            std::wstring_view replacement,
+                            bool all = false,
+                            bool match_case = false,
+                            bool regex = false);
 
     // Compatibility helpers apply to the currently active document.
     void ShowConflict(std::wstring message);

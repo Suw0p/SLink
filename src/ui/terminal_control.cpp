@@ -2,6 +2,7 @@
 // IME、剪贴板、鼠标协议及尺寸变更通知。
 #include "ui/terminal_control.hpp"
 #include "core/perf_trace.hpp"
+#include "find_bar.hpp"
 
 #include "terminal/libvterm_adapter.hpp"
 #include "terminal/terminal_input.hpp"
@@ -291,6 +292,11 @@ struct TerminalControl::Impl {
     POINT selection_anchor_pixel{};
     std::optional<TextPoint> selection_start;
     std::optional<TextPoint> selection_end;
+    detail::FindBar find_bar;
+    std::wstring last_find_query;
+    bool last_find_case{};
+    bool suppress_find_escape{};
+    bool suppress_find_character{};
     bool remote_left_down{};
     std::optional<std::pair<std::size_t, std::size_t>> last_remote_mouse_cell;
     wchar_t pending_high_surrogate{};
@@ -464,6 +470,7 @@ struct TerminalControl::Impl {
     }
 
     void ApplyTheme() {
+        find_bar.ApplyTheme();
         DeleteObject(background_brush);
         background_brush = CreateSolidBrush(TerminalBackground());
         ReleaseBackBuffer();
@@ -569,6 +576,7 @@ struct TerminalControl::Impl {
             return 0;
         case WM_SIZE:
             self->ResizeModel(LOWORD(lparam), HIWORD(lparam));
+            self->PlaceFindBar();
             return 0;
         case WM_TIMER:
             if (wparam == kResizeCommitTimerId) {
@@ -578,6 +586,8 @@ struct TerminalControl::Impl {
             break;
         case WM_DPICHANGED_AFTERPARENT:
             self->RecreateFont();
+            self->find_bar.ApplyTheme();
+            self->PlaceFindBar();
             self->ResizeFromClient();
             InvalidateRect(window, nullptr, TRUE);
             return 0;
@@ -822,8 +832,8 @@ struct TerminalControl::Impl {
         HDC window_dc = BeginPaint(hwnd, &paint);
         RECT client{};
         GetClientRect(hwnd, &client);
-        const bool new_buffer = !buffer_bitmap || buffer_width != client.right ||
-                                buffer_height != client.bottom;
+        const bool new_buffer =
+            !buffer_bitmap || buffer_width != client.right || buffer_height != client.bottom;
         if (!EnsureBackBuffer(window_dc, client.right, client.bottom)) {
             EndPaint(hwnd, &paint);
             return;
@@ -844,25 +854,27 @@ struct TerminalControl::Impl {
         ID2D1SolidColorBrush* d2d_brush = context.brush;
         render_target->BeginDraw();
         render_target->SetTransform(D2D1::Matrix3x2F::Identity());
-        render_target->PushAxisAlignedClip(
-            D2D1::RectF(static_cast<float>(dirty.left), static_cast<float>(dirty.top),
-                        static_cast<float>(dirty.right), static_cast<float>(dirty.bottom)),
-            D2D1_ANTIALIAS_MODE_ALIASED);
+        render_target->PushAxisAlignedClip(D2D1::RectF(static_cast<float>(dirty.left),
+                                                       static_cast<float>(dirty.top),
+                                                       static_cast<float>(dirty.right),
+                                                       static_cast<float>(dirty.bottom)),
+                                           D2D1_ANTIALIAS_MODE_ALIASED);
         const COLORREF terminal_background = TerminalBackground();
         d2d_brush->SetColor(D2D1::ColorF(GetRValue(terminal_background) / 255.0F,
                                          GetGValue(terminal_background) / 255.0F,
                                          GetBValue(terminal_background) / 255.0F));
-        render_target->FillRectangle(
-            D2D1::RectF(static_cast<float>(dirty.left), static_cast<float>(dirty.top),
-                        static_cast<float>(dirty.right), static_cast<float>(dirty.bottom)),
-            d2d_brush);
+        render_target->FillRectangle(D2D1::RectF(static_cast<float>(dirty.left),
+                                                 static_cast<float>(dirty.top),
+                                                 static_cast<float>(dirty.right),
+                                                 static_cast<float>(dirty.bottom)),
+                                     d2d_brush);
 
         const std::size_t start = ViewStart();
         const std::size_t first_row =
             static_cast<std::size_t>(std::max(0L, dirty.top) / cell_height);
-        const std::size_t last_row =
-            std::min(RowCount(), static_cast<std::size_t>(
-                                     (std::max(0L, dirty.bottom) + cell_height - 1) / cell_height));
+        const std::size_t last_row = std::min(
+            RowCount(),
+            static_cast<std::size_t>((std::max(0L, dirty.bottom) + cell_height - 1) / cell_height));
 
         // 第一遍只绘制背景。中文等宽字符会跨两个终端列，若在同一循环中交替绘制
         // “背景、字形”，后续单元格的背景可能覆盖前一个字形的右侧像素，选区背景下
@@ -976,8 +988,15 @@ struct TerminalControl::Impl {
         render_target->PopAxisAlignedClip();
         const HRESULT result = render_target->EndDraw();
         if (SUCCEEDED(result)) {
-            BitBlt(window_dc, dirty.left, dirty.top, dirty.right - dirty.left,
-                   dirty.bottom - dirty.top, buffer_dc, dirty.left, dirty.top, SRCCOPY);
+            BitBlt(window_dc,
+                   dirty.left,
+                   dirty.top,
+                   dirty.right - dirty.left,
+                   dirty.bottom - dirty.top,
+                   buffer_dc,
+                   dirty.left,
+                   dirty.top,
+                   SRCCOPY);
         } else if (result == D2DERR_RECREATE_TARGET) {
             detail::ResetSharedDcRenderTarget();
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -1287,9 +1306,24 @@ struct TerminalControl::Impl {
     }
 
     bool OnKeyDown(WPARAM key) {
+        suppress_find_character = false;
         const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+        if (control && shift && key == 'F' && !alt) {
+            suppress_find_character = true;
+            ShowFindBar();
+            return true;
+        }
+        if (key == VK_F3 && !alt && !control && find_bar.visible() && !find_bar.query().empty()) {
+            Find(find_bar.query(), shift, find_bar.match_case());
+            return true;
+        }
+        if (key == VK_ESCAPE && find_bar.visible()) {
+            suppress_find_escape = true;
+            find_bar.Hide();
+            return true;
+        }
         if ((control && shift && key == 'C') || (control && key == VK_INSERT)) {
             CopySelectionToClipboard();
             return true;
@@ -1370,8 +1404,14 @@ struct TerminalControl::Impl {
     }
 
     void OnCharacter(wchar_t character) {
+        if (character == 6 && std::exchange(suppress_find_character, false))
+            return;
         const bool control_down = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool shift_down = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (character == 27 && std::exchange(suppress_find_escape, false))
+            return;
+        if (character == 6 && control_down && shift_down)
+            return;
         if (terminal::IsClipboardShortcutCharacter(character, control_down, shift_down)) {
             return;
         }
@@ -1566,77 +1606,127 @@ struct TerminalControl::Impl {
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
-    std::wstring SearchableLine(std::size_t absolute_line) const {
-        const auto* line = LineAt(absolute_line);
-        if (!line) {
-            return {};
-        }
-        std::wstring result;
-        result.reserve(line->cells.size());
-        for (const auto& cell : line->cells) {
-            if (cell.width != 0) {
-                result += CodepointText(cell.codepoint);
-            }
-        }
-        return result;
+    void PlaceFindBar() {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        const int width =
+            std::min(static_cast<int>(rc.right), detail::ScaleForDpi(220, detail::WindowDpi(hwnd)));
+        find_bar.Place(std::max(0, static_cast<int>(rc.right) - width), 0, width);
     }
 
-    bool Find(std::wstring_view query, bool backwards) {
+    void ShowFindBar() {
+        // 多标签终端只在实际搜索时分配输入框和自绘资源。
+        if (!find_bar.hwnd()) {
+            if (!find_bar.Create(hwnd, instance, false))
+                return;
+            find_bar.action = [this](detail::FindBar::Action action) {
+                if (action == detail::FindBar::Action::Changed ||
+                    action == detail::FindBar::Action::Closed) {
+                    PlaceFindBar();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else {
+                    Find(find_bar.query(),
+                         action == detail::FindBar::Action::Previous,
+                         find_bar.match_case());
+                }
+            };
+        }
+        find_bar.Show(false, hwnd);
+        PlaceFindBar();
+    }
+
+    bool Find(std::wstring_view query, bool backwards, bool match_case = false) {
         if (query.empty()) {
+            find_bar.Status(L"请输入查找内容");
             return false;
         }
-        const std::size_t total_lines = HistorySize() + model.screen().size();
-        if (total_lines == 0) {
-            return false;
-        }
+        const auto less = [](TextPoint a, TextPoint b) {
+            return a.line < b.line || (a.line == b.line && a.column < b.column);
+        };
+        const bool repeat = last_find_query == query && last_find_case == match_case &&
+                            selection_has_extent && selection_start;
+        TextPoint anchor = selection_start.value_or(TextPoint{ViewStart(), 0});
+        last_find_query = query;
+        last_find_case = match_case;
         std::wstring needle(query);
-        std::ranges::transform(needle, needle.begin(), [](wchar_t value) {
+        const auto fold = [](wchar_t value) {
             return static_cast<wchar_t>(std::towlower(value));
-        });
-
-        std::size_t start_line = selection_end ? selection_end->line : ViewStart();
-        start_line = std::min(start_line, total_lines - 1);
-        for (std::size_t step = 0; step < total_lines; ++step) {
-            const std::size_t line_index = backwards
-                                               ? (start_line + total_lines - step) % total_lines
-                                               : (start_line + step) % total_lines;
-            std::wstring haystack = SearchableLine(line_index);
-            std::ranges::transform(haystack, haystack.begin(), [](wchar_t value) {
-                return static_cast<wchar_t>(std::towlower(value));
-            });
-
-            std::size_t position = std::wstring::npos;
-            if (backwards) {
-                const std::size_t before =
-                    step == 0 && selection_start && selection_start->line == line_index
-                        ? selection_start->column
-                        : haystack.size();
-                position = haystack.rfind(needle, before == 0 ? 0 : before - 1);
-            } else {
-                const std::size_t after =
-                    step == 0 && selection_end && selection_end->line == line_index
-                        ? selection_end->column + 1
-                        : 0;
-                position = haystack.find(needle, after);
-            }
-            if (position == std::wstring::npos) {
-                continue;
-            }
-            selection_start = TextPoint{line_index, position};
-            selection_end = TextPoint{line_index, position + needle.size() - 1};
-            selection_has_extent = true;
-            const std::size_t history = HistorySize();
-            if (line_index < history) {
-                view_offset = history - line_index;
-            } else {
-                view_offset = 0;
-            }
-            view_offset = std::min(view_offset, history);
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return true;
+        };
+        if (!match_case)
+            std::ranges::transform(needle, needle.begin(), fold);
+        struct Match {
+            TextPoint first, last;
+        };
+        std::optional<Match> chosen, wrapped;
+        // KMP 只保留查询长度的映射窗口，避免超长逻辑行复制整份历史；自动折行
+        // 保持匹配状态，真正换行则重置。UTF-16 单元映射回真实宽字符单元格。
+        std::vector<std::size_t> prefix(needle.size());
+        for (std::size_t i = 1, j = 0; i < needle.size(); ++i) {
+            while (j && needle[i] != needle[j])
+                j = prefix[j - 1];
+            if (needle[i] == needle[j])
+                ++j;
+            prefix[i] = j;
         }
-        MessageBeep(MB_ICONINFORMATION);
-        return false;
+        std::size_t matched = 0;
+        std::vector<Match> recent(needle.size());
+        std::size_t next_recent = 0;
+        const std::size_t total = HistorySize() + model.screen().size();
+        for (std::size_t row = 0; row < total; ++row) {
+            const auto* line = LineAt(row);
+            if (!line)
+                continue;
+            if (!line->continuation) {
+                matched = 0;
+                next_recent = 0;
+            }
+            for (std::size_t col = 0; col < line->cells.size(); ++col) {
+                const auto& cell = line->cells[col];
+                if (cell.width == 0)
+                    continue;
+                for (auto value : CodepointText(cell.codepoint)) {
+                    if (!match_case)
+                        value = fold(value);
+                    recent[next_recent] = {
+                        {row, col},
+                        {row,
+                         std::min(line->cells.size() - 1,
+                                  col + std::max(1U, unsigned(cell.width)) - 1)}};
+                    next_recent = (next_recent + 1) % recent.size();
+                    while (matched && needle[matched] != value)
+                        matched = prefix[matched - 1];
+                    if (needle[matched] == value)
+                        ++matched;
+                    if (matched != needle.size())
+                        continue;
+                    Match match{recent[next_recent].first,
+                                recent[(next_recent + recent.size() - 1) % recent.size()].last};
+                    // 顺序扫描时后向保留最后一个候选，前向保留第一个；同一行也可循环。
+                    if (!wrapped || backwards)
+                        wrapped = match;
+                    const bool suitable =
+                        backwards ? less(match.first, anchor) || (!repeat && match.first == anchor)
+                                  : less(anchor, match.first) || (!repeat && match.first == anchor);
+                    if (suitable && (!chosen || backwards))
+                        chosen = match;
+                    matched = prefix[matched - 1];
+                }
+            }
+        }
+        if (!chosen)
+            chosen = wrapped;
+        if (!chosen) {
+            find_bar.Status(L"未找到", true);
+            return false;
+        }
+        selection_start = chosen->first;
+        selection_end = chosen->last;
+        selection_has_extent = true;
+        const auto history = HistorySize();
+        view_offset = chosen->first.line < history ? history - chosen->first.line : 0;
+        find_bar.Status(L"已定位");
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return true;
     }
 
     std::wstring SelectedText() const {
@@ -1665,11 +1755,13 @@ struct TerminalControl::Impl {
                 }
                 line_text += CodepointText(line->cells[column].codepoint);
             }
-            while (!line_text.empty() && line_text.back() == L' ') {
+            const auto* next_line = LineAt(line_index + 1);
+            const bool soft_wrap = next_line && next_line->continuation;
+            while (!soft_wrap && !line_text.empty() && line_text.back() == L' ') {
                 line_text.pop_back();
             }
             result += line_text;
-            if (line_index != end.line) {
+            if (line_index != end.line && !soft_wrap) {
                 result += L"\r\n";
             }
         }
@@ -1768,18 +1860,19 @@ bool TerminalControl::Create(HWND parent, HINSTANCE instance, int control_id) {
     if (!Impl::Register(instance)) {
         return false;
     }
-    impl_->hwnd = CreateWindowExW(0,
-                                  kTerminalControlClass,
-                                  L"",
-                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS,
-                                  0,
-                                  0,
-                                  0,
-                                  0,
-                                  parent,
-                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(control_id)),
-                                  instance,
-                                  impl_.get());
+    impl_->hwnd =
+        CreateWindowExW(0,
+                        kTerminalControlClass,
+                        L"",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                        0,
+                        0,
+                        0,
+                        0,
+                        parent,
+                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(control_id)),
+                        instance,
+                        impl_.get());
     return impl_->hwnd != nullptr;
 }
 
@@ -1853,11 +1946,17 @@ void TerminalControl::SetOsc52PromptCallback(Osc52PromptCallback callback) {
 void TerminalControl::CopySelection() {
     impl_->CopySelectionToClipboard();
 }
+std::wstring TerminalControl::SelectionText() const {
+    return impl_->SelectedText();
+}
 void TerminalControl::PasteClipboard() {
     impl_->PasteFromClipboard();
 }
-bool TerminalControl::FindNext(std::wstring_view query, bool backwards) {
-    return impl_->Find(query, backwards);
+bool TerminalControl::FindNext(std::wstring_view query, bool backwards, bool match_case) {
+    return impl_->Find(query, backwards, match_case);
+}
+void TerminalControl::ShowFindBar() {
+    impl_->ShowFindBar();
 }
 HWND TerminalControl::hwnd() const noexcept {
     return impl_->hwnd;

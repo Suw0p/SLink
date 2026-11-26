@@ -40,6 +40,8 @@ enum class UiRole {
     primary_button,
     ghost_button,
     icon_button,
+    search_button,
+    input_field,
     toggle,
     panel,
     card,
@@ -65,10 +67,11 @@ enum class UiIcon {
     chevron,
     chevron_left,
     folder,
-    refresh,
     minimize,
     maximize,
     restore,
+    replace_one,
+    replace_all,
 };
 
 enum class UiTextAlign {
@@ -93,6 +96,7 @@ struct UiElement {
     // 可滚动内容的绘制和命中测试共用同一裁剪范围，避免覆盖固定导航或误点隐藏项。
     std::optional<D2D1_RECT_F> clip_bounds;
     bool outlined{};
+    bool error{};
 };
 
 class UiSurface final {
@@ -166,6 +170,7 @@ public:
                POINT point) noexcept;
     void Move(POINT point) noexcept;
     void Hide() noexcept;
+    void Destroy() noexcept;
 
 private:
     static LRESULT CALLBACK WindowProc(HWND, UINT, WPARAM, LPARAM);

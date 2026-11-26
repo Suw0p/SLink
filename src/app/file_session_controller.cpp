@@ -296,7 +296,7 @@ Status ExceptionStatus() noexcept {
 
 } // namespace
 
-// 控制器使用一个 Reactor 串行承载浏览/编辑会话。SessionRecord 的 mutex 只保护跨线程
+// 每台服务器独占 Reactor，同服务器的浏览/编辑串行，不同服务器不会相互阻塞。mutex 只保护跨线程
 // 快照和生命周期标记，真正的 session/endpoint 调用仍只能发生在 Reactor 线程。
 struct FileSessionController::Impl {
     enum class Phase {
@@ -316,6 +316,7 @@ struct FileSessionController::Impl {
         bool keepalive_pending{};
         std::vector<OpenCompletion> completions;
         ssh::ReactorTaskHandle connect_task;
+        std::shared_ptr<ssh::NetworkReactor> reactor;
 
         // session 只能由 NetworkReactor 解引用；赋值和 shared_ptr 快照受 mutex 保护，
         // EndpointFor 与关闭流程因此可以安全延长对象寿命，但不能直接调用 session。
@@ -328,7 +329,8 @@ struct FileSessionController::Impl {
     struct ControlState final {
         mutable std::mutex mutex;
         bool shutting_down{};
-        ssh::NetworkReactor* reactor{};
+        // 外部所有者保证 Reactor 不会在自身任务释放最后引用时析构；维护线程回收闲置项。
+        std::vector<std::shared_ptr<ssh::NetworkReactor>> reactors;
         std::shared_ptr<ssh::IUiDispatcher> dispatcher;
         std::unordered_map<std::string, std::shared_ptr<SessionRecord>> sessions;
     };
@@ -361,7 +363,6 @@ struct FileSessionController::Impl {
         }
     };
 
-    std::shared_ptr<ssh::NetworkReactor> reactor;
     std::shared_ptr<ControlState> state;
     std::filesystem::path known_hosts;
     std::mutex keepalive_mutex;
@@ -377,9 +378,7 @@ struct FileSessionController::Impl {
         if (known_hosts.empty() || !known_hosts.is_absolute()) {
             throw std::invalid_argument("known_hosts must be an absolute application-data path");
         }
-        reactor = std::make_shared<ssh::NetworkReactor>(dispatcher);
         state = std::make_shared<ControlState>();
-        state->reactor = reactor.get();
         state->dispatcher = std::move(dispatcher);
         keepalive_worker = std::thread([this] {
             KeepaliveLoop();
@@ -748,8 +747,7 @@ struct FileSessionController::Impl {
 
     void QueueKeepaliveSweep() noexcept {
         const auto local_state = state;
-        const auto local_reactor = reactor;
-        if (!local_state || !local_reactor) {
+        if (!local_state) {
             return;
         }
         std::vector<std::shared_ptr<SessionRecord>> records;
@@ -767,6 +765,7 @@ struct FileSessionController::Impl {
 
         const std::weak_ptr<ControlState> weak_state = local_state;
         for (const auto& record : records) {
+            const auto local_reactor = record->reactor;
             bool should_queue{};
             {
                 std::scoped_lock record_lock(record->mutex);
@@ -813,12 +812,34 @@ struct FileSessionController::Impl {
     }
 
     void KeepaliveLoop() noexcept {
+        auto next_keepalive = std::chrono::steady_clock::now() + kKeepaliveInterval;
         std::unique_lock lock(keepalive_mutex);
-        while (!keepalive_changed.wait_for(lock, kKeepaliveInterval, [this] {
+        while (!keepalive_changed.wait_for(lock, 1s, [this] {
             return keepalive_stopping;
         })) {
             lock.unlock();
-            QueueKeepaliveSweep();
+            if (std::chrono::steady_clock::now() >= next_keepalive) {
+                QueueKeepaliveSweep();
+                next_keepalive = std::chrono::steady_clock::now() + kKeepaliveInterval;
+            }
+            // 最后一份端点/任务引用消失后再回收，既不在 UI join，也不在 Reactor 自身析构。
+            try {
+                std::vector<std::shared_ptr<ssh::NetworkReactor>> idle;
+                {
+                    std::scoped_lock state_lock(state->mutex);
+                    idle.reserve(state->reactors.size());
+                    for (auto item = state->reactors.begin(); item != state->reactors.end();) {
+                        if (item->use_count() == 1) {
+                            idle.push_back(std::move(*item));
+                            item = state->reactors.erase(item);
+                        } else {
+                            ++item;
+                        }
+                    }
+                }
+                for (const auto& owner : idle)
+                    owner->shutdown();
+            } catch (...) {}
             lock.lock();
         }
     }
@@ -1128,6 +1149,8 @@ struct FileSessionController::Impl {
                 }
             } else {
                 record = std::make_shared<SessionRecord>(std::move(profile));
+                record->reactor = std::make_shared<ssh::NetworkReactor>(state->dispatcher);
+                state->reactors.push_back(record->reactor);
                 record->completions.push_back(std::move(completion));
                 state->sessions.emplace(record->profile.id, record);
             }
@@ -1163,6 +1186,7 @@ struct FileSessionController::Impl {
         // RunOpen 负责建立 TCP/SSH/SFTP 并清零凭据，FinishOpen 再一次性通知全部合并调用。
         auto authentication_ptr =
             std::make_shared<FileSessionAuthentication>(std::move(authentication));
+        const auto reactor = record->reactor;
         const std::weak_ptr<ControlState> weak_state = state;
         try {
             auto task = reactor->submit(
@@ -1244,7 +1268,7 @@ struct FileSessionController::Impl {
         }
         if (release) {
             connect_task.cancel();
-            QueueRelease(reactor, record);
+            QueueRelease(record->reactor, record);
         }
     }
 
@@ -1277,7 +1301,7 @@ struct FileSessionController::Impl {
             state->sessions.erase(found);
         }
         connect_task.cancel();
-        QueueRelease(reactor, record);
+        QueueRelease(record->reactor, record);
     }
 
     std::shared_ptr<ssh::ReactorEndpoint> EndpointFor(const transfer::FileUri& uri) const {
@@ -1338,6 +1362,7 @@ struct FileSessionController::Impl {
         }
 
         auto payload = std::make_shared<ListPayload>();
+        const auto reactor = record->reactor;
         const std::weak_ptr<ControlState> weak_state = state;
         try {
             return reactor->submit(
@@ -1430,8 +1455,7 @@ struct FileSessionController::Impl {
     void Shutdown() noexcept {
         StopKeepaliveWorker();
         const auto local_state = state;
-        auto local_reactor = reactor;
-        if (!local_state || !local_reactor) {
+        if (!local_state) {
             return;
         }
 
@@ -1461,41 +1485,23 @@ struct FileSessionController::Impl {
         for (const auto& task : connect_tasks) {
             task.cancel();
         }
-
-        auto barrier = std::make_shared<Barrier>();
-        try {
-            const auto cleanup =
-                local_reactor->submit([local_reactor, records = std::move(records)](
-                                          const ssh::CancellationToken& cancellation) mutable {
-                    for (const auto& record : records) {
-                        ReleaseRecordOnReactor(record, *local_reactor, cancellation);
-                    }
-                    records.clear();
+        for (const auto& record : records)
+            QueueRelease(record->reactor, record);
+        records.clear();
+        // 每台服务器分别排入不持有 Reactor 的屏障。清理在所属线程完成后才 join。
+        for (const auto& owner : local_state->reactors) {
+            try {
+                auto barrier = std::make_shared<Barrier>();
+                (void)owner->submit([barrier](const ssh::CancellationToken&) {
+                    barrier->signal();
                     return Status::ok();
                 });
-            (void)cleanup;
-            // This sentinel intentionally does not capture NetworkReactor. By
-            // the time it starts, every earlier task (including cleanup tasks
-            // that did capture the reactor) has destroyed its queue item. The
-            // controller can then release its owner reference without making
-            // NetworkReactor's destructor run on its own worker thread.
-            const auto sentinel = local_reactor->submit([barrier](const ssh::CancellationToken&) {
-                barrier->signal();
-                return Status::ok();
-            });
-            (void)sentinel;
-            barrier->wait();
-        } catch (...) {
-            // NetworkReactor accepts work until its destructor initiates
-            // shutdown. Reaching this path means construction or ownership was
-            // already violated; keep teardown noexcept.
+                barrier->wait();
+                // 不强停仍被端点快照/迟到 UI 回调持有的 Reactor；这些副本的析构
+                // 还需封送 SFTP handle 释放。屏障后撤掉控制器所有权即可安全延寿。
+            } catch (...) {}
         }
-
-        {
-            std::scoped_lock lock(local_state->mutex);
-            local_state->reactor = nullptr;
-        }
-        reactor.reset();
+        local_state->reactors.clear();
     }
 };
 

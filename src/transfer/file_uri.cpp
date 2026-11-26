@@ -61,6 +61,7 @@ std::string percent_encode(std::string_view input) {
 std::string normalize_path(std::string_view input, const bool local) {
     std::string text(input);
     std::replace(text.begin(), text.end(), '\\', '/');
+    const bool unc = local && text.starts_with("//");
 
     std::string drive;
     std::size_t begin = 0;
@@ -83,7 +84,7 @@ std::string normalize_path(std::string_view input, const bool local) {
             text.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
         if (!part.empty() && part != ".") {
             if (part == "..") {
-                if (!components.empty()) {
+                if (components.size() > (unc ? 2U : 0U) && components.back() != "..") {
                     components.pop_back();
                 } else if (!absolute) {
                     components.emplace_back(part);
@@ -98,8 +99,8 @@ std::string normalize_path(std::string_view input, const bool local) {
         begin = end + 1;
     }
 
-    std::string result = drive;
-    if (absolute || !drive.empty() || !local) {
+    std::string result = unc ? "//" : drive;
+    if (!unc && (absolute || !drive.empty() || !local)) {
         result += '/';
     }
     for (std::size_t i = 0; i < components.size(); ++i) {
@@ -199,6 +200,12 @@ FileUri FileUri::sftp(std::string_view server_id, std::string_view path) {
 }
 
 FileUri FileUri::parent() const {
+    // UNC 的共享根不能退成当前盘符根，也不能通过 .. 越过共享边界。
+    if (is_local() && path_.starts_with("//")) {
+        const auto share = path_.find('/', 2);
+        if (share == std::string::npos || path_.find('/', share + 1) == std::string::npos)
+            return *this;
+    }
     if (path_ == "/" || (path_.size() == 3 && path_[1] == ':' && path_[2] == '/')) {
         return *this;
     }
@@ -232,6 +239,8 @@ FileUri FileUri::with_path(std::string_view path) const {
 }
 
 std::string FileUri::filename() const {
+    if (is_local() && path_.starts_with("//") && parent() == *this)
+        return {};
     if (path_ == "/") {
         return {};
     }

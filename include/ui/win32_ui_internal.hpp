@@ -26,6 +26,8 @@ inline COLORREF& kBorderColor = theme::kBorderColor;
 inline COLORREF& kTextColor = theme::kTextColor;
 inline COLORREF& kMutedTextColor = theme::kMutedTextColor;
 inline COLORREF& kAccentColor = theme::kAccentColor;
+// 目录工具栏共用同一刷新符号，避免各页面出现不同的刷新造型。
+inline constexpr wchar_t kRefreshGlyph[] = L"↻";
 
 inline int ScaleForDpi(int value, UINT dpi) {
     return MulDiv(value, static_cast<int>(dpi), 96);
@@ -338,12 +340,11 @@ inline bool DrawSelfDrawnButton(const DRAWITEMSTRUCT& draw,
         DeleteObject(fill);
         text_rect.left = check.right + ScaleForDpi(7, WindowDpi(draw.hwndItem));
     } else {
-                const COLORREF fill_color = disabled ? kPanelColor
-                                     : primary
-                                         ? (pressed ? (theme::IsDark() ? RGB(105, 131, 192)
-                                                                       : RGB(58, 84, 145))
-                                                    : kAccentColor)
-                                         : (pressed ? theme::kPanelHoverColor : kPanelAltColor);
+        const COLORREF fill_color =
+            disabled  ? kPanelColor
+            : primary ? (pressed ? (theme::IsDark() ? RGB(105, 131, 192) : RGB(58, 84, 145))
+                                 : kAccentColor)
+                      : (pressed ? theme::kPanelHoverColor : kPanelAltColor);
         const HBRUSH fill = CreateSolidBrush(fill_color);
         const HPEN border =
             CreatePen(PS_SOLID, 1, primary && !disabled ? kAccentColor : kBorderColor);
@@ -365,7 +366,7 @@ inline bool DrawSelfDrawnButton(const DRAWITEMSTRUCT& draw,
         draw.hDC, reinterpret_cast<HFONT>(SendMessageW(draw.hwndItem, WM_GETFONT, 0, 0)));
     SetBkMode(draw.hDC, TRANSPARENT);
     SetTextColor(draw.hDC,
-                 disabled ? kMutedTextColor
+                 disabled  ? kMutedTextColor
                  : primary ? (theme::IsDark() ? kWindowColor : RGB(255, 255, 255))
                            : kTextColor);
     DrawTextW(draw.hDC,

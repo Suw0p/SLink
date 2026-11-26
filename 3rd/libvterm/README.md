@@ -19,6 +19,14 @@ with the corrected upstream implementation as well.
 SLink additionally disables historical-line reflow in its adapter. The source-level
 fix remains covered by a direct reflow regression test as defense in depth.
 
+The bundled public callback structs also provide the optional SLink
+`sb_pushline_info` extension. The state layer reports outgoing row metadata before
+scrolling mutates `lineinfo`; the screen layer forwards cells together with their
+soft-wrap boundaries. Consumers that only use the original `sb_pushline` keep
+the original path. SLink uses this information for logical-line history search
+and copying, without treating explicit CR/LF as soft wraps. These headers and
+the static library must be rebuilt together; this is not an upstream ABI change.
+
 For memory-safety verification, configure with
 `-DSLINK_ENABLE_ADDRESS_SANITIZER=ON -DSLINK_BUILD_TESTS=ON` and build a
 `RelWithDebInfo` test target. The terminal resize regression suite is compatible with

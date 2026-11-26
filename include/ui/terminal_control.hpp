@@ -57,10 +57,12 @@ public:
     void SetOsc52PromptCallback(Osc52PromptCallback callback);
 
     void CopySelection();
+    [[nodiscard]] std::wstring SelectionText() const;
     void PasteClipboard();
     // 搜索当前屏幕及有上限的回滚缓冲区，选中结果并滚动到可见区域；重复调用会从
     // 当前匹配之后继续，并在末尾循环一次。
-    bool FindNext(std::wstring_view query, bool backwards = false);
+    bool FindNext(std::wstring_view query, bool backwards = false, bool match_case = false);
+    void ShowFindBar();
     HWND hwnd() const noexcept;
     std::size_t rows() const noexcept;
     std::size_t columns() const noexcept;

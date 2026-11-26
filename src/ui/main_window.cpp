@@ -37,6 +37,7 @@ constexpr int kLightThemeId = 1203;
 constexpr int kSharedServerSearchId = 1204;
 constexpr int kSharedServerListId = 1205;
 constexpr int kServerUngroupedId = 1206;
+constexpr int kEditorWordWrapId = 1207;
 // 分组 ID 只允许字母、数字和 -_.；该保留值可安全表示未分组标题的折叠状态。
 constexpr std::string_view kUngroupedCollapseKey = "@ungrouped";
 constexpr int kMinimizeWindowId = 1210;
@@ -134,6 +135,8 @@ struct MainWindow::Impl {
     std::function<bool(const std::vector<std::string>&)> collapsed_groups_changed;
     std::function<bool(bool)> server_ungrouped_changed;
     bool server_ungrouped{};
+    bool editor_word_wrap{};
+    std::function<bool(bool)> editor_word_wrap_changed;
     std::string selected_server_id;
     std::size_t visible_server_count{};
     bool rebuilding_server_list{};
@@ -1012,6 +1015,15 @@ struct MainWindow::Impl {
             CommitLayoutNow();
             return;
         }
+        if (id == kEditorWordWrapId) {
+            const bool next = !editor_word_wrap;
+            if (editor_word_wrap_changed && !editor_word_wrap_changed(next))
+                return;
+            editor_word_wrap = next;
+            editor->SetWordWrap(next);
+            CommitLayoutNow();
+            return;
+        }
     }
 
     void ApplyThemeNow(const theme::Mode mode) {
@@ -1370,7 +1382,7 @@ struct MainWindow::Impl {
         const float body_top = top + 64.0F * scale;
         const float body_bottom = std::max(body_top + 1.0F, height - 22.0F * scale);
         const bool stacked_action = column_width < 300.0F * scale;
-        const float content_height = stacked_action ? 294.0F : 242.0F;
+        const float content_height = stacked_action ? 388.0F : 336.0F;
         settings_scroll_max_dip = static_cast<int>(
             std::ceil(std::max(0.0F, content_height - (body_bottom - body_top) / scale)));
         settings_scroll_dip = std::clamp(settings_scroll_dip, 0, settings_scroll_max_dip);
@@ -1417,15 +1429,28 @@ struct MainWindow::Impl {
         add({.role = detail::UiRole::separator,
              .bounds = detail::UiRect(
                  left + 10.0F * scale, y(154), right - 10.0F * scale, y(154) + scale)});
+        add({.role = detail::UiRole::label,
+             .bounds = detail::UiRect(left, y(176), right - 70.0F * scale, y(200)),
+             .text = L"编辑器自动换行"});
+        add({.role = detail::UiRole::muted,
+             .bounds = detail::UiRect(left, y(202), right - 66.0F * scale, y(226)),
+             .text = L"仅调整显示，不改变文件内容"});
+        add({.id = kEditorWordWrapId,
+             .role = detail::UiRole::toggle,
+             .bounds = detail::UiRect(right - 52.0F * scale, y(190), right - 10.0F * scale, y(212)),
+             .selected = editor_word_wrap});
+        add({.role = detail::UiRole::separator,
+             .bounds = detail::UiRect(
+                 left + 10.0F * scale, y(248), right - 10.0F * scale, y(248) + scale)});
         const float text_right = stacked_action ? right : right - 140.0F * scale;
         add({.role = detail::UiRole::label,
-             .bounds = detail::UiRect(left, y(176), text_right, y(200)),
+             .bounds = detail::UiRect(left, y(270), text_right, y(294)),
              .text = L"服务器管理"});
         add({.role = detail::UiRole::muted,
-             .bounds = detail::UiRect(left, y(202), text_right, y(226)),
+             .bounds = detail::UiRect(left, y(296), text_right, y(320)),
              .text = L"连接与分组"});
         const float button_left = stacked_action ? left + 10.0F * scale : right - 126.0F * scale;
-        const float button_top = stacked_action ? 244.0F : 184.0F;
+        const float button_top = stacked_action ? 338.0F : 278.0F;
         add({.id = kManageServersId,
              .role = detail::UiRole::ghost_button,
              .bounds = detail::UiRect(
@@ -1679,6 +1704,14 @@ void MainWindow::SetServerUngroupedPreference(const bool ungrouped,
     impl_->server_ungrouped = ungrouped;
     impl_->server_ungrouped_changed = std::move(changed_callback);
     impl_->PopulateServerList(true);
+    impl_->CommitLayoutNow();
+}
+
+void MainWindow::SetEditorWordWrapPreference(const bool enabled,
+                                             std::function<bool(bool)> changed_callback) {
+    impl_->editor_word_wrap = enabled;
+    impl_->editor_word_wrap_changed = std::move(changed_callback);
+    impl_->editor->SetWordWrap(enabled);
     impl_->CommitLayoutNow();
 }
 

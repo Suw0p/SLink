@@ -189,7 +189,7 @@ struct TerminalPage::Impl {
     int resize_preview_position{-1};
     bool tab_drag_armed{};
     bool tab_dragging{};
-    int dragged_tab{-1};
+    int dragged_tab_id{};
     POINT tab_drag_origin{};
     SplitDropZone visible_drop_zone{SplitDropZone::none};
     std::optional<std::size_t> visible_drop_pane;
@@ -199,7 +199,18 @@ struct TerminalPage::Impl {
     PaneCreatedCallback pane_created;
 
     ~Impl() {
+        DestroyAuxiliaryWindows();
         DeleteObject(selector_font);
+    }
+
+    void DestroyAuxiliaryWindows() noexcept {
+        // WS_POPUP 的实际 owner 可能是顶层主窗口，不能依赖销毁子页面顺带释放。
+        tab_drag_visual.Destroy();
+        for (HWND* helper : {&tab_tooltip, &resize_guide}) {
+            const HWND window = std::exchange(*helper, nullptr);
+            if (window && IsWindow(window))
+                DestroyWindow(window);
+        }
     }
 
     void RecreateSelectorFont() {
@@ -360,9 +371,30 @@ struct TerminalPage::Impl {
         case WM_DESTROY:
             KillTimer(window, kTabMotionTimerId);
             KillTimer(window, kDragScrollTimerId);
+            self->DestroyAuxiliaryWindows();
+            break;
+        case WM_NCDESTROY:
+            SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            self->hwnd = nullptr;
+            return DefWindowProcW(window, message, wparam, lparam);
+        case WM_GETDLGCODE:
+            if (self->tab_drag_armed || self->tab_dragging)
+                return DLGC_WANTALLKEYS;
+            break;
+        case WM_KEYDOWN:
+            if (self->tab_drag_armed || self->tab_dragging) {
+                if (wparam == VK_ESCAPE)
+                    self->CancelDrag(true);
+                return 0;
+            }
+            break;
+        case WM_CHAR:
+        case WM_SYSCHAR:
+            if (self->tab_drag_armed || self->tab_dragging)
+                return 0;
             break;
         case WM_CANCELMODE:
-            self->CancelDrag();
+            self->CancelDrag(true);
             self->surface.CancelPointer();
             return 0;
         case WM_NOTIFY:
@@ -449,7 +481,7 @@ struct TerminalPage::Impl {
             self->resize_preview_position = -1;
             self->resize_mode = ResizeMode::none;
             self->resize_start_weights.clear();
-            self->CancelDrag();
+            self->CancelDrag(true);
             self->surface.CancelPointer();
             return 0;
         case WM_SETCURSOR:
@@ -694,19 +726,36 @@ struct TerminalPage::Impl {
         if (const auto* action = ActionForId(id); action && action->kind == TabHitKind::activate) {
             const auto index = action->pane_index;
             Focus(index);
-            dragged_tab = static_cast<int>(index);
+            dragged_tab_id = pane_tab_ids[index].activate;
             tab_drag_origin = point;
             tab_drag_current = point;
             tab_drag_armed = true;
             tab_dragging = false;
         }
-        return surface.PointerDown(point);
+        const bool captured = surface.PointerDown(point);
+        if (tab_drag_armed)
+            SetFocus(hwnd); // 拖动期间键盘属于页面，不能进入 SSH/本地 CMD。
+        return captured;
+    }
+
+    std::optional<std::size_t> TabIndexForId(int id) const noexcept {
+        if (id == 0)
+            return std::nullopt;
+        const auto found = std::ranges::find(pane_tab_ids, id, &PaneTabIds::activate);
+        return found == pane_tab_ids.end() ? std::nullopt
+                                           : std::optional<std::size_t>(static_cast<std::size_t>(
+                                                 found - pane_tab_ids.begin()));
     }
 
     void HandlePointerMove(POINT point, WPARAM key_state) {
         if (!tab_dragging)
             surface.PointerMove(point);
         if (!tab_drag_armed || (key_state & MK_LBUTTON) == 0) {
+            return;
+        }
+        const auto source = TabIndexForId(dragged_tab_id);
+        if (!source) {
+            CancelDrag(true);
             return;
         }
         if (!tab_dragging && (std::abs(point.x - tab_drag_origin.x) >=
@@ -722,7 +771,7 @@ struct TerminalPage::Impl {
         tab_drag_current = point;
         UpdateEdgeScroll(point);
         MoveTabDragPreview(point);
-        const auto next_insertion = TabInsertionAt(point, static_cast<std::size_t>(dragged_tab));
+        const auto next_insertion = TabInsertionAt(point, *source);
         const auto next_pane = next_insertion ? std::nullopt : PaneAt(point);
         const SplitDropZone next = next_insertion ? SplitDropZone::none : DropZoneAt(point);
         if (next != visible_drop_zone || next_pane != visible_drop_pane ||
@@ -737,14 +786,15 @@ struct TerminalPage::Impl {
 
     void HandlePointerUp(POINT point) {
         const bool dragged = tab_dragging;
-        const int tab = dragged_tab;
+        const int tab = dragged_tab_id;
         const auto clicked = surface.PointerUp(point);
-        if (dragged && tab >= 0) {
-            HandleTabDrop(static_cast<std::size_t>(tab), point);
-            CancelDrag();
+        if (dragged) {
+            if (const auto source = TabIndexForId(tab))
+                HandleTabDrop(*source, point);
+            CancelDrag(true);
             return;
         }
-        CancelDrag();
+        CancelDrag(true);
         if (clicked) {
             HandleClick(*clicked);
         }
@@ -850,14 +900,15 @@ struct TerminalPage::Impl {
         HandlePointerMove(tab_drag_current, MK_LBUTTON);
     }
 
-    void CancelDrag() {
+    void CancelDrag(bool restore_focus = false) {
+        const bool had_drag = tab_drag_armed || tab_dragging;
         const bool had_drop_visual =
             visible_drop_zone != SplitDropZone::none || visible_tab_insertion.has_value();
         tab_drag_armed = false;
         tab_dragging = false;
         drag_scroll_direction.reset();
         KillTimer(hwnd, kDragScrollTimerId);
-        dragged_tab = -1;
+        dragged_tab_id = 0;
         visible_drop_pane.reset();
         visible_tab_insertion.reset();
         tab_drag_visual.Hide();
@@ -866,17 +917,22 @@ struct TerminalPage::Impl {
             BuildElements();
             InvalidateTabStrip();
         }
+        if (had_drag)
+            surface.CancelPointer();
+        if (restore_focus && had_drag && GetFocus() == hwnd && active_pane < panes.size())
+            SetFocus(panes[active_pane]->hwnd());
     }
 
     void BeginTabDragPreview(POINT point) {
-        if (dragged_tab < 0 || static_cast<std::size_t>(dragged_tab) >= pane_titles.size())
+        const auto source = TabIndexForId(dragged_tab_id);
+        if (!source)
             return;
-        const auto id = pane_tab_element_ids[dragged_tab];
+        const auto id = pane_tab_element_ids[*source];
         for (const auto& element : surface.elements())
             if (element.id == id && element.role == detail::UiRole::file_tab) {
                 tab_drag_visual.Begin(hwnd,
                                       kTabDragPreviewClass,
-                                      pane_titles[dragged_tab],
+                                      pane_titles[*source],
                                       detail::UiIcon::terminal,
                                       element.bounds,
                                       tab_drag_origin,
@@ -1001,19 +1057,18 @@ struct TerminalPage::Impl {
     }
 
     SplitDropZone DropZoneAt(const POINT point, const int source_tab = -1) const noexcept {
-        const int source = source_tab >= 0 ? source_tab : dragged_tab;
+        const auto source = source_tab >= 0 ? std::optional<std::size_t>(source_tab)
+                                            : TabIndexForId(dragged_tab_id);
         if (const auto strip = TabStripAt(point))
-            return split_active && source >= 0 &&
-                           GroupOf(*strip) != GroupOf(static_cast<std::size_t>(source))
+            return split_active && source && GroupOf(*strip) != GroupOf(*source)
                        ? SplitDropZone::center
                        : SplitDropZone::none;
         const auto target = PaneAt(point);
         if (!target)
             return SplitDropZone::none;
         if (split_active)
-            return source >= 0 && GroupOf(*target) != GroupOf(static_cast<std::size_t>(source))
-                       ? SplitDropZone::center
-                       : SplitDropZone::none;
+            return source && GroupOf(*target) != GroupOf(*source) ? SplitDropZone::center
+                                                                  : SplitDropZone::none;
         const auto& rect = pane_rects[*target];
         // 标签栏负责排序；离开标签栏后，内容区左右两侧都可分屏。
         // 不再把落点压缩到外缘 96 DIP，仅在中心留少量取消区防止误放。
@@ -1310,6 +1365,7 @@ struct TerminalPage::Impl {
         if (!selected_server || *selected_server >= server_ids.size() || !server_activated) {
             return false;
         }
+        CancelDrag(true);
         const std::size_t server_index = *selected_server;
         std::size_t pane_index = ActivePane();
         if (pane_index < pane_assigned.size() && pane_assigned[pane_index]) {
@@ -1340,6 +1396,7 @@ struct TerminalPage::Impl {
     }
 
     void AddHorizontal() {
+        CancelDrag(true);
         const std::size_t previous_active = ActivePane();
         const std::size_t previous_left_active = group_active[0];
         const bool was_split = split_active;
@@ -1379,6 +1436,7 @@ struct TerminalPage::Impl {
         if (active >= panes.size()) {
             return;
         }
+        CancelDrag(); // 必须在回调、窗口销毁及数组收缩之前丢弃落点。
         const bool was_split = split_active;
         for (TerminalControl*& pending : reveal_tab) {
             if (pending == panes[active].get()) {
@@ -1414,6 +1472,8 @@ struct TerminalPage::Impl {
             RECT rect{};
             GetClientRect(hwnd, &rect);
             Layout(rect.right, rect.bottom);
+            if (GetFocus() == hwnd && !panes.empty())
+                SetFocus(panes[active_pane]->hwnd());
             return;
         }
         if (active < encoding_selectors.size() && encoding_selectors[active] &&
@@ -1453,6 +1513,8 @@ struct TerminalPage::Impl {
         RECT rect{};
         GetClientRect(hwnd, &rect);
         Layout(rect.right, rect.bottom);
+        if (GetFocus() == hwnd && active_pane < panes.size())
+            SetFocus(panes[active_pane]->hwnd());
     }
 
     void BuildElements() {

@@ -2209,6 +2209,20 @@ int Application::Run(HINSTANCE instance, int show_command) {
             }
             return saved.ok();
         });
+    bool editor_word_wrap = false;
+    if (auto stored = impl_->repository->GetSetting("editor_word_wrap"); stored && stored.value())
+        editor_word_wrap = *stored.value() == "true";
+    impl_->main_window->SetEditorWordWrapPreference(
+        editor_word_wrap, [application_state](bool enabled) {
+            const auto saved = application_state->repository->SetSetting(
+                "editor_word_wrap", enabled ? "true" : "false");
+            if (!saved)
+                MessageBoxW(application_state->main_window->hwnd(),
+                            (L"无法保存编辑器自动换行设置。\r\n\r\n" + saved.message).c_str(),
+                            L"SLink",
+                            MB_OK | MB_ICONERROR);
+            return saved.ok();
+        });
     impl_->ui_dispatcher =
         std::make_shared<ssh::FunctionUiDispatcher>([main_window](std::function<void()> callback) {
             main_window->PostUiTask(std::move(callback));

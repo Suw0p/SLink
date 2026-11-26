@@ -57,6 +57,8 @@ static_assert(sizeof(TerminalCell) <= 16,
 struct TerminalLine {
     std::vector<TerminalCell> cells;
     bool wrapped{};
+    // 当前行是上一行自动折行的延续；不包括用户输出的 CR/LF。
+    bool continuation{};
 };
 
 struct CursorPosition {

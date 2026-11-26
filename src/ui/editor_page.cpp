@@ -2,6 +2,7 @@
 // 分隔条均只维护 UI 状态，远程 I/O 通过 EditorController 回调执行。
 #include "ui/editor_page.hpp"
 #include "editor/gb2312_codec.hpp"
+#include "find_bar.hpp"
 
 #include "ui/file_icon_provider.hpp"
 #include "ui/local_shortcut.hpp"
@@ -61,6 +62,8 @@ bool ClientAnimationsEnabled() noexcept {
 }
 
 constexpr UINT kSciSetCodePage = 2037;
+constexpr UINT kSciSetWrapMode = 2268;
+constexpr UINT kSciWrapCount = 2235;
 constexpr UINT kSciSetReadOnly = 2171;
 constexpr UINT kSciSetText = 2181;
 constexpr UINT kSciGetText = 2182;
@@ -72,11 +75,11 @@ constexpr UINT kSciStyleSetBold = 2053;
 constexpr UINT kSciStyleSetFont = 2056;
 constexpr UINT kSciStyleSetSize = 2055;
 constexpr UINT kSciSetCaretFore = 2069;
-constexpr UINT kSciSetSelBack = 2068;
-constexpr UINT kSciSetSelAlpha = 2478;
+constexpr UINT kSciSetElementColour = 2753;
+constexpr UINT kSciSetSelectionLayer = 2763;
 constexpr UINT kSciSetCaretLineVisible = 2096;
 constexpr UINT kSciSetCaretLineBack = 2098;
-constexpr UINT kSciSetCaretLineBackAlpha = 2470;
+constexpr UINT kSciSetCaretLineLayer = 2765;
 constexpr UINT kSciSetMarginLeft = 2155;
 constexpr UINT kSciSetMarginRight = 2157;
 constexpr UINT kSciSetExtraAscent = 2526;
@@ -94,6 +97,13 @@ constexpr UINT kSciSetScrollWidth = 2274;
 constexpr UINT kSciGetScrollWidth = 2275;
 constexpr UINT kSciSetScrollWidthTracking = 2516;
 constexpr UINT kSciGetFirstVisibleLine = 2152;
+constexpr UINT kSciSetFirstVisibleLine = 2613;
+constexpr UINT kSciVisibleFromDocLine = 2220;
+constexpr UINT kSciEnsureVisible = 2232;
+constexpr UINT kSciPointYFromPosition = 2165;
+constexpr UINT kSciPointXFromPosition = 2164;
+constexpr UINT kSciTextHeight = 2279;
+constexpr UINT kSciScrollRange = 2569;
 constexpr UINT kSciLinesOnScreen = 2370;
 constexpr UINT kSciLineScroll = 2168;
 constexpr UINT kSciGetXOffset = 2398;
@@ -107,6 +117,23 @@ constexpr UINT kSciLineLength = 2350;
 constexpr UINT kSciGetLine = 2153;
 constexpr UINT kSciSetILexer = 4033;
 constexpr UINT kSciColourise = 4003;
+constexpr UINT kSciGetSelectionStart = 2143;
+constexpr UINT kSciGetSelectionEnd = 2145;
+constexpr UINT kSciSetSel = 2160;
+constexpr UINT kSciSetTargetStart = 2190;
+constexpr UINT kSciGetTargetStart = 2191;
+constexpr UINT kSciSetTargetEnd = 2192;
+constexpr UINT kSciGetTargetEnd = 2193;
+constexpr UINT kSciReplaceTarget = 2194;
+constexpr UINT kSciReplaceTargetRe = 2195;
+constexpr UINT kSciSearchInTarget = 2197;
+constexpr UINT kSciSetSearchFlags = 2198;
+constexpr UINT kSciBeginUndoAction = 2078;
+constexpr UINT kSciEndUndoAction = 2079;
+constexpr UINT kSciPositionAfter = 2418;
+constexpr UINT kSciPositionBefore = 2417;
+constexpr UINT kSciSetStatus = 2382;
+constexpr UINT kSciGetStatus = 2383;
 
 constexpr UINT kScCpUtf8 = 65001;
 constexpr UINT_PTR kStyleDefault = 32;
@@ -493,6 +520,15 @@ struct EditorPage::Impl {
     HWND encoding_selector{};
     HWND file_list{};
     HWND editor{};
+    detail::FindBar find_bar;
+    bool batch_replacing{};
+    bool word_wrap{};
+    bool suppress_search_escape{};
+    WPARAM suppress_search_character{};
+    std::optional<EditorDocumentId> last_search_document;
+    std::wstring last_search_query;
+    LRESULT last_search_position{-1};
+    bool last_search_case{}, last_search_regex{};
     HWND editor_horizontal_scrollbar{};
     HWND editor_vertical_scrollbar{};
     HWND preview{};
@@ -847,6 +883,8 @@ struct EditorPage::Impl {
             case WM_SIZE: {
                 const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
                 self->UpdateEditorScrollbarWindows();
+                if (self->word_wrap)
+                    self->ScheduleHorizontalScrollbarUpdate();
                 return result;
             }
             case WM_MOUSEHWHEEL:
@@ -857,7 +895,33 @@ struct EditorPage::Impl {
             }
         }
         if (message == WM_KEYDOWN && self) {
+            self->suppress_search_character = 0;
             const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            if (control && wparam == 'F') {
+                self->suppress_search_character = 6;
+                self->ShowFindBar(false);
+                return 0;
+            }
+            if (control && wparam == 'H') {
+                // 替换只从查找条左侧箭头展开；不再执行旧快捷键。
+                self->suppress_search_character = 8;
+                return 0;
+            }
+            if (wparam == VK_F3) {
+                if (self->find_bar.query().empty())
+                    self->ShowFindBar(false);
+                else
+                    self->FindText(self->find_bar.query(),
+                                   (GetKeyState(VK_SHIFT) & 0x8000) != 0,
+                                   self->find_bar.match_case(),
+                                   self->find_bar.regex());
+                return 0;
+            }
+            if (wparam == VK_ESCAPE && self->find_bar.visible()) {
+                self->suppress_search_escape = true;
+                self->find_bar.Hide();
+                return 0;
+            }
             if (control) {
                 switch (wparam) {
                 case 'S':
@@ -879,8 +943,14 @@ struct EditorPage::Impl {
                 return 0;
             }
         }
+        if (message == WM_CHAR && self && self->suppress_search_character == wparam &&
+            std::exchange(self->suppress_search_character, 0) != 0)
+            return 0;
+        if (message == WM_CHAR && self && wparam == VK_ESCAPE &&
+            std::exchange(self->suppress_search_escape, false))
+            return 0;
         if (message == WM_CHAR && self && (GetKeyState(VK_CONTROL) & 0x8000) != 0 &&
-            (wparam == 19 || wparam == 23)) {
+            (wparam == 19 || wparam == 23 || wparam == 6 || wparam == 8)) {
             return 0;
         }
         return DefSubclassProc(window, message, wparam, lparam);
@@ -906,6 +976,310 @@ struct EditorPage::Impl {
         if (control) {
             SetWindowSubclass(control, &ChildSubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));
         }
+    }
+
+    void PlaceFindBar() {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        const auto m = Measure(rc.right, rc.bottom);
+        const int gap = detail::ScaleForDpi(6, detail::WindowDpi(hwnd));
+        const int width = std::max(
+            0,
+            std::min(m.right_width - gap * 2, detail::ScaleForDpi(240, detail::WindowDpi(hwnd))));
+        find_bar.Place(m.right_x + m.right_width - gap - width, m.header_height + gap, width);
+    }
+
+    void ShowFindBar(bool replace) {
+        if (!ActiveDocument() || !scintilla_available || !IsWindowVisible(editor))
+            return;
+        find_bar.Show(replace, editor);
+        PlaceFindBar();
+    }
+
+    std::optional<std::string> SearchBytes(std::wstring_view text) {
+        auto bytes = WideToUtf8(text);
+        const auto* document = ActiveDocument();
+        if (document && document->encoding == EditorTextEncoding::Legacy8Bit) {
+            auto encoded = editor::EncodeGb2312(bytes);
+            if (!encoded) {
+                find_bar.Status(L"当前文件编码无法表示这些字符", true);
+                return std::nullopt;
+            }
+            return encoded;
+        }
+        return bytes;
+    }
+
+    LRESULT
+    SearchRange(std::string_view query, LRESULT start, LRESULT end, bool match_case, bool regex) {
+        SendMessageW(editor, kSciSetStatus, 0, 0);
+        SendMessageW(editor,
+                     kSciSetSearchFlags,
+                     (match_case ? 4 : 0) | (regex ? 0x00200000 | 0x00800000 : 0),
+                     0);
+        const auto search = [&](LRESULT first, LRESULT last) {
+            SendMessageW(editor, kSciSetTargetStart, first, 0);
+            SendMessageW(editor, kSciSetTargetEnd, last, 0);
+            return SendMessageA(
+                editor, kSciSearchInTarget, query.size(), reinterpret_cast<LPARAM>(query.data()));
+        };
+        const bool needs_right_context = regex && (query.find("(?=") != std::string_view::npos ||
+                                                   query.find("(?!") != std::string_view::npos ||
+                                                   query.find("\\b") != std::string_view::npos ||
+                                                   query.find("\\B") != std::string_view::npos ||
+                                                   query.find('$') != std::string_view::npos);
+        if (!needs_right_context || start <= end)
+            return search(start, end);
+        // C++ 正则的反向目标范围会截断右侧上下文。仅对依赖该上下文的表达式
+        // 向前枚举候选，取光标前最近的一处，普通搜索仍走控件的直接反向查找。
+        // 保留重叠和零长度匹配，避免前瞻/单词边界因此跳到错误结果。
+        const auto length = SendMessageW(editor, kSciGetTextLength, 0, 0);
+        LRESULT cursor = end, previous = -1;
+        for (;;) {
+            const auto found = search(cursor, length);
+            if (SendMessageW(editor, kSciGetStatus, 0, 0) != 0)
+                return -1;
+            if (found < 0 || found > start)
+                break;
+            if (SendMessageW(editor, kSciGetTargetEnd, 0, 0) <= start)
+                previous = found;
+            const auto next = SendMessageW(editor, kSciPositionAfter, found, 0);
+            if (next <= found || next > start)
+                break;
+            cursor = next;
+        }
+        // 重新绑定最终目标及捕获组，供调用方读取边界或执行单次正则替换。
+        return previous < 0 ? -1 : search(previous, length);
+    }
+
+    bool SearchEncodingSupported(bool regex) {
+        const auto* document = ActiveDocument();
+        if (regex && document && document->encoding == EditorTextEncoding::Legacy8Bit) {
+            // 未确认的八位内容仍按原始字节保存。不能把正则的单字符匹配应用到半个
+            // 双字节汉字；用户先选择 UTF-8/GB2312 完成无损解码后才开放正则。
+            find_bar.Status(L"请先选择文件编码，再使用正则表达式", true);
+            return false;
+        }
+        return true;
+    }
+
+    void RevealSearchMatch(LRESULT start, LRESULT end) {
+        const auto line = SendMessageW(editor, kSciLineFromPosition, start, 0);
+        SendMessageW(editor, kSciEnsureVisible, line, 0);
+        if (end > start)
+            SendMessageW(editor,
+                         kSciEnsureVisible,
+                         SendMessageW(editor, kSciLineFromPosition, end - 1, 0),
+                         0);
+        // 优先显示匹配的开头，而不是只滚动到选区末端；长行也不会把开头滚走。
+        UpdateScrollWidthForCurrentLine();
+        SendMessageW(editor, kSciScrollRange, end, start);
+        RECT client{};
+        GetClientRect(editor, &client);
+        const int line_height =
+            static_cast<int>(std::max<LRESULT>(1, SendMessageW(editor, kSciTextHeight, line, 0)));
+        int safe_top = line_height;
+        RECT overlay{};
+        if (find_bar.visible()) {
+            GetWindowRect(find_bar.hwnd(), &overlay);
+            MapWindowPoints(HWND_DESKTOP, editor, reinterpret_cast<POINT*>(&overlay), 2);
+            const auto x = SendMessageW(editor, kSciPointXFromPosition, 0, start);
+            const auto last_x = SendMessageW(editor, kSciPointXFromPosition, 0, end);
+            if (last_x > overlay.left && x < overlay.right)
+                safe_top = std::max(safe_top, static_cast<int>(overlay.bottom) + line_height);
+        }
+        const auto y = SendMessageW(editor, kSciPointYFromPosition, 0, start);
+        if (y < safe_top || y + line_height > client.bottom - line_height) {
+            // 自动换行时同一文档行有多个显示行，定位到命中所在的那一段而非行首。
+            const auto display_line = SendMessageW(editor, kSciGetFirstVisibleLine, 0, 0) +
+                                      std::max<LRESULT>(0, y) / line_height;
+            const int preferred_y = std::max(safe_top, static_cast<int>(client.bottom) / 2);
+            const int usable_y = std::max(0, static_cast<int>(client.bottom) - line_height * 2);
+            SendMessageW(
+                editor,
+                kSciSetFirstVisibleLine,
+                std::max<LRESULT>(0, display_line - std::min(preferred_y, usable_y) / line_height),
+                0);
+        }
+        // 文档头几行不能继续向下滚动。若结果仍在浮层下面，平移长行，让匹配
+        // 落到浮层左侧；不移动查找条或抢回键盘焦点。
+        if (!IsRectEmpty(&overlay)) {
+            const auto match_y = SendMessageW(editor, kSciPointYFromPosition, 0, start);
+            const auto match_x = SendMessageW(editor, kSciPointXFromPosition, 0, start);
+            const auto end_x = SendMessageW(editor, kSciPointXFromPosition, 0, end);
+            if (match_y < overlay.bottom && match_y + line_height > overlay.top &&
+                end_x > overlay.left && match_x < overlay.right) {
+                const auto margin = SendMessageW(editor, kSciGetMarginWidthN, 0, 0) +
+                                    SendMessageW(editor, kSciGetMarginLeft, 0, 0);
+                const auto delta = std::clamp<LRESULT>(
+                    end_x - overlay.left + line_height, 0, std::max<LRESULT>(0, match_x - margin));
+                SendMessageW(
+                    editor, kSciSetXOffset, SendMessageW(editor, kSciGetXOffset, 0, 0) + delta, 0);
+            }
+        }
+        UpdateEditorScrollbarWindows();
+        InvalidateRect(editor, nullptr, FALSE);
+    }
+
+    bool FindText(std::wstring_view query, bool backwards, bool match_case, bool regex) {
+        if (!ActiveDocument() || !scintilla_available)
+            return false;
+        if (!SearchEncodingSupported(regex))
+            return false;
+        if (query.empty()) {
+            find_bar.Status(L"请输入查找内容");
+            return false;
+        }
+        auto bytes = SearchBytes(query);
+        if (!bytes)
+            return false;
+        const LRESULT length = SendMessageW(editor, kSciGetTextLength, 0, 0);
+        LRESULT start =
+            SendMessageW(editor, backwards ? kSciGetSelectionStart : kSciGetSelectionEnd, 0, 0);
+        bool wrap = false;
+        if (regex && last_search_document == active_id && last_search_query == query &&
+            last_search_case == match_case && last_search_regex && last_search_position == start &&
+            SendMessageW(editor, kSciGetSelectionStart, 0, 0) ==
+                SendMessageW(editor, kSciGetSelectionEnd, 0, 0)) {
+            const auto next =
+                SendMessageW(editor, backwards ? kSciPositionBefore : kSciPositionAfter, start, 0);
+            wrap = next == start;
+            start = next;
+        }
+        LRESULT found =
+            wrap ? -1 : SearchRange(*bytes, start, backwards ? 0 : length, match_case, regex);
+        if (SendMessageW(editor, kSciGetStatus, 0, 0) != 0) {
+            find_bar.Status(L"正则表达式无效", true);
+            return false;
+        }
+        if (found < 0)
+            // 回绕必须搜索完整文档，不能在原光标处截断匹配正文。
+            found = SearchRange(
+                *bytes, backwards ? length : 0, backwards ? 0 : length, match_case, regex);
+        if (found < 0) {
+            find_bar.Status(L"未找到", true);
+            return false;
+        }
+        const auto end = SendMessageW(editor, kSciGetTargetEnd, 0, 0);
+        last_search_document = active_id;
+        last_search_query = query;
+        last_search_case = match_case;
+        last_search_regex = regex;
+        last_search_position = found == end ? found : -1;
+        SendMessageW(editor, kSciSetSel, found, end);
+        RevealSearchMatch(found, end);
+        find_bar.Status(L"已定位");
+        return true;
+    }
+
+    std::size_t ReplaceText(std::wstring_view query,
+                            std::wstring_view replacement,
+                            bool all,
+                            bool match_case,
+                            bool regex) {
+        auto* document = ActiveDocument();
+        if (!document || !scintilla_available || document->kind != EditorDocumentKind::Text ||
+            document->read_only || document->saving || document->closing) {
+            find_bar.Status(L"当前文件不可修改", true);
+            return 0;
+        }
+        if (query.empty()) {
+            find_bar.Status(L"请输入查找内容");
+            return 0;
+        }
+        if (!SearchEncodingSupported(regex))
+            return 0;
+        auto needle = SearchBytes(query);
+        auto text = SearchBytes(replacement);
+        if (!needle || !text)
+            return 0;
+        LRESULT length = SendMessageW(editor, kSciGetTextLength, 0, 0);
+        LRESULT start = 0;
+        if (!all) {
+            start = SendMessageW(editor, kSciGetSelectionStart, 0, 0);
+            const auto end = SendMessageW(editor, kSciGetSelectionEnd, 0, 0);
+            // 前瞻等正则需要选区右侧的上下文；先在完整后文中匹配，再验证边界。
+            const auto selected = SearchRange(*needle, start, length, match_case, regex);
+            if (selected != start || SendMessageW(editor, kSciGetTargetEnd, 0, 0) != end) {
+                if (!FindText(query, false, match_case, regex))
+                    return 0;
+                start = SendMessageW(editor, kSciGetSelectionStart, 0, 0);
+            }
+        }
+        // 批量修改只通知一次控制器，避免每个匹配都复制整篇正文并调度恢复缓存。
+        const bool was_dirty = document->dirty;
+        batch_replacing = true;
+        SendMessageW(editor, kSciBeginUndoAction, 0, 0);
+        std::size_t count{};
+        bool invalid = false, too_large = false;
+        for (;;) {
+            const auto found = SearchRange(*needle, start, length, match_case, regex);
+            if (SendMessageW(editor, kSciGetStatus, 0, 0) != 0) {
+                invalid = true;
+                break;
+            }
+            if (found < 0)
+                break;
+            const auto match_end = SendMessageW(editor, kSciGetTargetEnd, 0, 0);
+            constexpr LRESULT maximum = 40 * 1024 * 1024;
+            if (length - (match_end - found) + static_cast<LRESULT>(text->size()) > maximum) {
+                too_large = true;
+                break;
+            }
+            const auto written = SendMessageA(editor,
+                                              regex ? kSciReplaceTargetRe : kSciReplaceTarget,
+                                              text->size(),
+                                              reinterpret_cast<LPARAM>(text->data()));
+            if (written < 0)
+                break;
+            ++count;
+            length = SendMessageW(editor, kSciGetTextLength, 0, 0);
+            start = SendMessageW(editor, kSciGetTargetEnd, 0, 0);
+            if (length > maximum) {
+                too_large = true;
+                break;
+            }
+            if (!all) {
+                SendMessageW(editor, kSciSetSel, start, start);
+                if (match_end == found) {
+                    last_search_document = active_id;
+                    last_search_query = query;
+                    last_search_case = match_case;
+                    last_search_regex = regex;
+                    last_search_position = start;
+                }
+                break;
+            }
+            // 零长度正则必须跨过原文的一个完整字符，不搜索刚插入的内容。
+            if (match_end == found) {
+                const auto after = SendMessageW(editor, kSciPositionAfter, start, 0);
+                if (after <= start || start >= length)
+                    break;
+                start = after;
+            }
+        }
+        SendMessageW(editor, kSciEndUndoAction, 0, 0);
+        if (too_large && count != 0) {
+            SendMessageW(editor, 2176 /* SCI_UNDO */, 0, 0);
+            count = 0;
+            document->dirty = was_dirty;
+        }
+        batch_replacing = false;
+        if (count != 0) {
+            document->dirty = true;
+            UpdateLineNumberMargin();
+            ScheduleHorizontalScrollbarUpdate();
+            UpdateStatus();
+            InvokeSafely(document_changed, document->id);
+            if (!all)
+                FindText(query, false, match_case, regex);
+        }
+        find_bar.Status(invalid     ? L"正则表达式无效"
+                        : too_large ? L"替换后超出编辑大小限制，操作已取消"
+                        : count     ? L"已替换 " + std::to_wstring(count) + L" 处"
+                                    : L"未找到",
+                        invalid || too_large || count == 0);
+        return count;
     }
 
     void NavigateFromPath() {
@@ -1077,15 +1451,24 @@ struct EditorPage::Impl {
                                                left_inset - right_inset - edge_padding * 2);
         const int content_width =
             std::max(1, static_cast<int>(SendMessageW(editor, kSciGetScrollWidth, 0, 0)));
-        metrics.horizontal_max = std::max(0, content_width - metrics.horizontal_page);
+        metrics.horizontal_max =
+            word_wrap ? 0 : std::max(0, content_width - metrics.horizontal_page);
         metrics.horizontal_position =
             std::clamp(static_cast<int>(SendMessageW(editor, kSciGetXOffset, 0, 0)),
                        0,
                        metrics.horizontal_max);
         metrics.horizontal_visible = metrics.horizontal_max > 0;
 
-        const int line_count =
+        const int document_lines =
             std::max(1, static_cast<int>(SendMessageW(editor, kSciGetLineCount, 0, 0)));
+        // 自绘滚动条使用显示行总数，视觉折行不能被误当成只有一行而隐藏竖向滚动条。
+        const int line_count =
+            word_wrap
+                ? std::max(1,
+                           static_cast<int>(
+                               SendMessageW(editor, kSciVisibleFromDocLine, document_lines - 1, 0) +
+                               SendMessageW(editor, kSciWrapCount, document_lines - 1, 0)))
+                : document_lines;
         metrics.vertical_page =
             std::max(1, static_cast<int>(SendMessageW(editor, kSciLinesOnScreen, 0, 0)));
         metrics.vertical_max = std::max(0, line_count - metrics.vertical_page);
@@ -1407,6 +1790,7 @@ struct EditorPage::Impl {
         const COLORREF margin_background = editor_background;
         const COLORREF margin_foreground = dark ? RGB(105, 108, 115) : RGB(135, 139, 146);
         const auto* document = ActiveDocument();
+        SendMessageW(editor, kSciSetWrapMode, word_wrap ? 1 /* SC_WRAP_WORD */ : 0, 0);
         SendMessageW(editor,
                      kSciSetCodePage,
                      document && document->encoding == EditorTextEncoding::Legacy8Bit ? 0
@@ -1424,11 +1808,22 @@ struct EditorPage::Impl {
             editor, kSciStyleSetFont, kStyleLineNumber, reinterpret_cast<LPARAM>("Consolas"));
         SendMessageW(editor, kSciStyleSetSize, kStyleLineNumber, 9);
         SendMessageW(editor, kSciSetCaretFore, theme::kTextColor, 0);
-        SendMessageW(editor, kSciSetSelBack, TRUE, dark ? RGB(70, 91, 125) : RGB(188, 208, 236));
-        SendMessageW(editor, kSciSetSelAlpha, 150, 0);
+        // 搜索时键盘焦点在查找框，仍需保留清晰的正文选区。用不透明底层配色，
+        // 不再把高亮半透明地盖在字形上，也不让系统失焦灰色吞掉选区。
+        SendMessageW(editor, kSciSetSelectionLayer, 0 /* SC_LAYER_BASE */, 0);
+        const auto selection_text = dark ? RGB(255, 255, 255) : RGB(20, 35, 54);
+        const auto selection_back = dark ? RGB(48, 88, 143) : RGB(185, 213, 249);
+        const auto inactive_back = dark ? RGB(48, 76, 112) : RGB(202, 220, 244);
+        for (const int element : {10, 12, 16, 18})
+            SendMessageW(editor, kSciSetElementColour, element, selection_text | 0xff000000U);
+        for (const int element : {11, 13})
+            SendMessageW(editor, kSciSetElementColour, element, selection_back | 0xff000000U);
+        for (const int element : {17, 19})
+            SendMessageW(editor, kSciSetElementColour, element, inactive_back | 0xff000000U);
         SendMessageW(editor, kSciSetCaretLineVisible, TRUE, 0);
         SendMessageW(editor, kSciSetCaretLineBack, dark ? RGB(43, 45, 49) : RGB(237, 240, 244), 0);
-        SendMessageW(editor, kSciSetCaretLineBackAlpha, 120, 0);
+        // 当前行底色也放到文字下层，不能再用半透明覆盖层压暗选区及选中文字。
+        SendMessageW(editor, kSciSetCaretLineLayer, 0 /* SC_LAYER_BASE */, 0);
         SendMessageW(editor, kSciSetMarginLeft, 0, detail::ScaleForDpi(8, detail::WindowDpi(hwnd)));
         SendMessageW(
             editor, kSciSetMarginRight, 0, detail::ScaleForDpi(8, detail::WindowDpi(hwnd)));
@@ -1591,7 +1986,12 @@ struct EditorPage::Impl {
     }
 
     void LoadActiveDocument() {
+        last_search_document.reset();
+        find_bar.Status(L"");
+        if (!ActiveDocument() && find_bar.visible())
+            find_bar.Hide(false);
         auto* document = ActiveDocument();
+        find_bar.EnableRegex(document && document->encoding != EditorTextEncoding::Legacy8Bit);
         if (encoding_selector) {
             const bool editable =
                 document && document->kind == EditorDocumentKind::Text && !document->read_only;
@@ -1828,6 +2228,8 @@ struct EditorPage::Impl {
             }
         }
         if (header.hwndFrom == editor && header.code == kScnUpdateUi) {
+            if (batch_replacing)
+                return false;
             UpdateEditorScrollbarWindows();
             if (!loading_document)
                 UpdateStatus();
@@ -1839,12 +2241,15 @@ struct EditorPage::Impl {
                 return false;
             }
             if (header.code == kScnModified) {
+                last_search_document.reset();
                 const auto& notification =
                     reinterpret_cast<const ScintillaNotificationPrefix&>(header);
                 if ((notification.modification_type & (kScModInsertText | kScModDeleteText)) == 0) {
                     return false;
                 }
                 document->dirty = true;
+                if (batch_replacing)
+                    return false;
                 UpdateLineNumberMargin();
                 UpdateScrollWidthForCurrentLine();
                 // SCI_SETSCROLLWIDTHTRACKING updates the measured width after
@@ -1857,11 +2262,15 @@ struct EditorPage::Impl {
                 return false;
             }
             if (header.code == kScnSavePointLeft) {
+                if (batch_replacing)
+                    return false;
                 document->dirty = true;
                 UpdateStatus();
                 return false;
             }
             if (header.code == kScnSavePointReached && !document->saving) {
+                if (batch_replacing)
+                    return false;
                 UpdateStatus();
                 return false;
             }
@@ -2191,7 +2600,7 @@ struct EditorPage::Impl {
                                static_cast<float>(m.path_top),
                                static_cast<float>(file_left + left_width - pad),
                                static_cast<float>(m.path_top + m.path_height)),
-            .icon = detail::UiIcon::refresh,
+            .text = detail::kRefreshGlyph,
             .alignment = detail::UiTextAlign::center,
             .enabled = !selected_server_id.empty(),
         });
@@ -2532,6 +2941,7 @@ struct EditorPage::Impl {
         place(status_bar, m.owner);
         place(status_details, m.details);
         place(encoding_selector, m.encoding);
+        PlaceFindBar();
 
         if (conflict_visible) {
             conflict_splitter_y = m.conflict_y - gap / 2;
@@ -2588,6 +2998,28 @@ bool EditorPage::Create(HWND parent, HINSTANCE instance) {
     if (!impl_->surface.Initialize(impl_->hwnd)) {
         return false;
     }
+    if (!impl_->find_bar.Create(impl_->hwnd, instance, true))
+        return false;
+    impl_->find_bar.action = [self = impl_.get()](detail::FindBar::Action action) {
+        if (action == detail::FindBar::Action::Changed ||
+            action == detail::FindBar::Action::Closed) {
+            self->PlaceFindBar();
+            if (action == detail::FindBar::Action::Closed)
+                InvalidateRect(self->editor, nullptr, FALSE);
+        } else if (action == detail::FindBar::Action::Replace ||
+                   action == detail::FindBar::Action::ReplaceAll) {
+            self->ReplaceText(self->find_bar.query(),
+                              self->find_bar.replacement(),
+                              action == detail::FindBar::Action::ReplaceAll,
+                              self->find_bar.match_case(),
+                              self->find_bar.regex());
+        } else {
+            self->FindText(self->find_bar.query(),
+                           action == detail::FindBar::Action::Previous,
+                           self->find_bar.match_case(),
+                           self->find_bar.regex());
+        }
+    };
     impl_->resize_guide =
         CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
                         kEditorResizeGuideClass,
@@ -2689,7 +3121,8 @@ bool EditorPage::Create(HWND parent, HINSTANCE instance) {
     if (impl_->editor) {
         SetWindowLongPtrW(impl_->editor,
                           GWL_STYLE,
-                          GetWindowLongPtrW(impl_->editor, GWL_STYLE) | WS_CLIPCHILDREN);
+                          GetWindowLongPtrW(impl_->editor, GWL_STYLE) | WS_CLIPCHILDREN |
+                              WS_CLIPSIBLINGS);
         impl_->ConfigureScintilla();
         impl_->editor_horizontal_scrollbar = CreateWindowExW(
             0, L"STATIC", L"", WS_CHILD, 0, 0, 0, 0, impl_->editor, nullptr, instance, nullptr);
@@ -2707,22 +3140,22 @@ bool EditorPage::Create(HWND parent, HINSTANCE instance) {
                           3,
                           reinterpret_cast<DWORD_PTR>(impl_.get()));
     }
-    impl_->preview = CreateWindowExW(0,
-                                     L"EDIT",
-                                     impl_->scintilla_available
-                                         ? L""
-                                         : L"未找到 Scintilla.dll。\r\n请将 Scintilla.dll 和 "
-                                           L"Lexilla.dll 放在应用程序目录。",
-                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE |
-                                         ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
-                                     0,
-                                     0,
-                                     0,
-                                     0,
-                                     impl_->hwnd,
-                                     nullptr,
-                                     instance,
-                                     nullptr);
+    impl_->preview = CreateWindowExW(
+        0,
+        L"EDIT",
+        impl_->scintilla_available ? L""
+                                   : L"未找到 Scintilla.dll。\r\n请将 Scintilla.dll 和 "
+                                     L"Lexilla.dll 放在应用程序目录。",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | ES_MULTILINE | ES_READONLY |
+            ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+        0,
+        0,
+        0,
+        0,
+        impl_->hwnd,
+        nullptr,
+        instance,
+        nullptr);
     impl_->status_bar =
         CreateWindowExW(0,
                         L"STATIC",
@@ -2836,7 +3269,19 @@ void EditorPage::Show(bool visible) {
                  RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 
+void EditorPage::ShowFindBar(bool replace) {
+    impl_->ShowFindBar(replace);
+}
+bool EditorPage::FindText(std::wstring_view query, bool backwards, bool match_case, bool regex) {
+    return impl_->FindText(query, backwards, match_case, regex);
+}
+std::size_t EditorPage::ReplaceText(
+    std::wstring_view query, std::wstring_view replacement, bool all, bool match_case, bool regex) {
+    return impl_->ReplaceText(query, replacement, all, match_case, regex);
+}
+
 void EditorPage::ApplyTheme() {
+    impl_->find_bar.ApplyTheme();
     detail::ApplyThemeToWindowTree(impl_->hwnd);
     table::ApplyTheme(impl_->file_list);
     if (impl_->editor) {
@@ -2849,6 +3294,22 @@ void EditorPage::ApplyTheme() {
                  nullptr,
                  nullptr,
                  RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
+void EditorPage::SetWordWrap(bool enabled) {
+    if (std::exchange(impl_->word_wrap, enabled) == enabled || !impl_->editor ||
+        !impl_->scintilla_available)
+        return;
+    SendMessageW(impl_->editor, kSciSetWrapMode, enabled ? 1 : 0, 0);
+    if (enabled)
+        SendMessageW(impl_->editor, kSciSetXOffset, 0, 0);
+    // 先让控件完成折行，再读取显示行数量更新滚动条，不重载或复制正文。
+    RedrawWindow(impl_->editor, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    impl_->UpdateEditorScrollbarWindows();
+}
+
+bool EditorPage::word_wrap() const noexcept {
+    return impl_->word_wrap;
 }
 
 void EditorPage::RefreshLayout() {

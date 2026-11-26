@@ -105,7 +105,7 @@ struct LibVTermAdapter::Impl {
         screen_callbacks.settermprop = &OnSetTermProp;
         screen_callbacks.bell = &OnBell;
         screen_callbacks.resize = &OnResize;
-        screen_callbacks.sb_pushline = &OnScrollbackPush;
+        screen_callbacks.sb_pushline_info = &OnScrollbackPush;
         screen_callbacks.sb_popline = &OnScrollbackPop;
         vterm_screen_set_callbacks(vterm_screen, &screen_callbacks, this);
         // Keep each cached row coherent. Interactive line editors frequently
@@ -120,6 +120,7 @@ struct LibVTermAdapter::Impl {
         vterm_screen_enable_reflow(vterm_screen, false);
         vterm_screen_reset(vterm_screen, 1);
         fallback.enable_state_tracking_only();
+        UpdateLineInfo();
     }
 
     ~Impl() {
@@ -163,6 +164,7 @@ struct LibVTermAdapter::Impl {
         if (pending_vterm_input.empty() && bytes.find('\x1B') == std::string_view::npos) {
             vterm_input_write(terminal, bytes.data(), bytes.size());
             vterm_screen_flush_damage(vterm_screen);
+            UpdateLineInfo();
             return;
         }
         pending_vterm_input.append(bytes);
@@ -213,6 +215,18 @@ struct LibVTermAdapter::Impl {
         if (!filtered.empty()) {
             vterm_input_write(terminal, filtered.data(), filtered.size());
             vterm_screen_flush_damage(vterm_screen);
+            UpdateLineInfo();
+        }
+    }
+
+    void UpdateLineInfo() {
+        if (!terminal)
+            return;
+        // resize 回调执行期间 state->lineinfo 仍可能指向待替换的旧数组。
+        // 只在输入或尺寸更新完整返回后读取，不能在 damage/moverect 回调中读取。
+        for (std::size_t row = 0; row < visible.size(); ++row) {
+            const auto* info = vterm_state_get_lineinfo(vterm_obtain_state(terminal), SafeInt(row));
+            visible[row].continuation = info && info->continuation;
         }
     }
 
@@ -324,20 +338,36 @@ struct LibVTermAdapter::Impl {
         return 1;
     }
 
-    static int OnScrollbackPush(int columns, const VTermScreenCell* cells, void* user) {
+    static int OnScrollbackPush(
+        int columns, const VTermScreenCell* cells, int continuation_line, int wrapped, void* user) {
         auto* self = static_cast<Impl*>(user);
         if (!self || columns <= 0 || !cells) {
             return 1;
         }
         const TerminalCell blank{};
         int used_columns = columns;
-        while (used_columns > 0 && ConvertCell(cells[used_columns - 1]) == blank) {
+        while (!wrapped && used_columns > 0 && ConvertCell(cells[used_columns - 1]) == blank) {
             --used_columns;
         }
         TerminalLine line;
+        line.continuation = continuation_line != 0;
+        line.wrapped = wrapped != 0;
         line.cells.reserve(static_cast<std::size_t>(used_columns));
+        bool continuation = false;
         for (int column = 0; column < used_columns; ++column) {
-            line.cells.push_back(ConvertCell(cells[column]));
+            auto converted = ConvertCell(cells[column]);
+            // 回滚行与可见屏幕使用相同的宽字符尾格模型，避免中文历史夹入伪空格。
+            if (continuation) {
+                converted.codepoint = 0;
+                converted.width = 0;
+                continuation = false;
+            } else if (converted.width == 0) {
+                converted.codepoint = U' ';
+                converted.width = 1;
+            } else {
+                continuation = converted.width > 1;
+            }
+            line.cells.push_back(converted);
         }
         self->fallback.push_scrollback_line(std::move(line));
         self->full_damage = true;
@@ -395,6 +425,7 @@ void LibVTermAdapter::resize(std::size_t rows, std::size_t columns) {
         vterm_set_size(impl_->terminal, Impl::SafeInt(rows), Impl::SafeInt(columns));
         vterm_screen_flush_damage(impl_->vterm_screen);
         impl_->Refresh(VTermRect{0, Impl::SafeInt(rows), 0, Impl::SafeInt(columns)});
+        impl_->UpdateLineInfo();
     } else {
         impl_->fallback.resize(rows, columns);
         impl_->full_damage = true;

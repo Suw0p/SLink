@@ -63,6 +63,7 @@ public:
     void SetCollapsedServerGroups(std::vector<std::string> group_ids,
                                   std::function<bool(const std::vector<std::string>&)> changed);
     void SetServerUngroupedPreference(bool ungrouped, std::function<bool(bool)> changed_callback);
+    void SetEditorWordWrapPreference(bool enabled, std::function<bool(bool)> changed_callback);
     bool SelectServerSidebarItem(std::string_view server_id);
     void SetThemePreference(theme::Mode selected,
                             std::function<bool(theme::Mode)> changed_callback);

@@ -205,12 +205,14 @@ struct TerminalBuffer::Impl {
             screen[cursor.row].wrapped = true;
             cursor.column = 0;
             LineFeed();
+            screen[cursor.row].continuation = true;
         }
         const std::size_t width = std::min(CodepointWidth(codepoint), column_count);
         if (width == 2 && cursor.column + 1 >= column_count) {
             screen[cursor.row].wrapped = true;
             cursor.column = 0;
             LineFeed();
+            screen[cursor.row].continuation = true;
         }
         TerminalCell& first = screen[cursor.row].cells[cursor.column];
         first.codepoint = codepoint;
