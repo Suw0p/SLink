@@ -24,7 +24,7 @@ namespace SLink::app {
 namespace {
 
 constexpr std::uint32_t kProtocolMagic = 0x4B4E4C53U; // SLNK
-constexpr std::uint32_t kProtocolVersion = 1;
+constexpr std::uint32_t kProtocolVersion = 2;
 constexpr wchar_t kPipePrefix[] = LR"(\\.\pipe\SLink.Firewall.)";
 constexpr wchar_t kRulePrefix[] = L"SLink Port Forward ";
 constexpr wchar_t kRuleGroup[] = L"SLink";
@@ -36,6 +36,7 @@ enum class HelperOperation : std::uint32_t {
     remove_rule = 3,
     shutdown_if_clean = 4,
     terminate_after_cleanup = 5,
+    cleanup_recovery_rule = 6,
 };
 
 struct HelperRequest {
@@ -44,6 +45,7 @@ struct HelperRequest {
     HelperOperation operation{HelperOperation::initialize};
     std::uint16_t local_port{};
     std::uint16_t reserved{};
+    wchar_t cleanup_session[33]{};
 };
 
 struct HelperResponse {
@@ -51,6 +53,7 @@ struct HelperResponse {
     std::uint32_t version{kProtocolVersion};
     std::int32_t result{};
     std::uint32_t enabled{};
+    std::uint32_t cleanup_confirmed{};
     wchar_t message[192]{};
 };
 
@@ -197,6 +200,29 @@ std::wstring SessionMutexName(std::wstring_view session) {
     return L"Local\\SLink.Firewall.Session." + std::wstring(session);
 }
 
+// 访问被拒绝等错误不能解释为会话不存在，否则会误删仍在使用的其他实例规则。
+bool SessionDefinitelyInactive(std::wstring_view session) {
+    UniqueHandle active(OpenMutexW(SYNCHRONIZE, FALSE, SessionMutexName(session).c_str()));
+    return !active && GetLastError() == ERROR_FILE_NOT_FOUND;
+}
+
+// 先完整、可靠地枚举，再开始删除。枚举中断、接口/名称读取失败均不能返回成功。
+template <typename Next, typename ReadName>
+HRESULT CollectRuleNames(Next next, ReadName read_name, std::vector<std::wstring>& names) {
+    for (;;) {
+        const HRESULT result = next();
+        if (result == S_FALSE)
+            return S_OK;
+        if (result != S_OK)
+            return FAILED(result) ? result : E_UNEXPECTED;
+        std::wstring name;
+        const HRESULT read = read_name(name);
+        if (read != S_OK)
+            return FAILED(read) ? read : E_UNEXPECTED;
+        names.push_back(std::move(name));
+    }
+}
+
 class FirewallPolicy final {
 public:
     HRESULT Open() {
@@ -308,8 +334,7 @@ public:
             const std::wstring_view session = rest.substr(0, separator);
             if (!ValidSessionId(session) || session == current_session)
                 return false;
-            UniqueHandle active(OpenMutexW(SYNCHRONIZE, FALSE, SessionMutexName(session).c_str()));
-            return !active;
+            return SessionDefinitelyInactive(session);
         });
     }
 
@@ -332,27 +357,42 @@ private:
         VARIANT value{};
         VariantInit(&value);
         ULONG fetched{};
-        while (values->Next(1, &value, &fetched) == S_OK) {
-            if (value.vt == VT_DISPATCH && value.pdispVal) {
+        result = CollectRuleNames(
+            [&] {
+                VariantClear(&value);
+                VariantInit(&value);
+                fetched = 0;
+                const auto status = values->Next(1, &value, &fetched);
+                if ((status == S_OK && fetched == 1) || (status == S_FALSE && fetched == 0))
+                    return status;
+                return FAILED(status) ? status : E_UNEXPECTED;
+            },
+            [&](std::wstring& name) -> HRESULT {
+                if (value.vt != VT_DISPATCH || !value.pdispVal)
+                    return E_UNEXPECTED;
                 ComPtr<INetFwRule> rule;
-                if (SUCCEEDED(value.pdispVal->QueryInterface(
-                        __uuidof(INetFwRule), reinterpret_cast<void**>(rule.put())))) {
-                    BSTR raw_name{};
-                    if (SUCCEEDED(rule->get_Name(&raw_name)) && raw_name) {
-                        std::wstring name(raw_name, SysStringLen(raw_name));
-                        SysFreeString(raw_name);
-                        if (predicate(name))
-                            names.push_back(std::move(name));
-                    }
-                }
-            }
-            VariantClear(&value);
-            VariantInit(&value);
-        }
+                auto status = value.pdispVal->QueryInterface(__uuidof(INetFwRule),
+                                                             reinterpret_cast<void**>(rule.put()));
+                if (status != S_OK || !rule)
+                    return FAILED(status) ? status : E_UNEXPECTED;
+                BSTR raw_name{};
+                status = rule->get_Name(&raw_name);
+                if (status == S_OK && raw_name)
+                    name.assign(raw_name, SysStringLen(raw_name));
+                else if (SUCCEEDED(status))
+                    status = E_UNEXPECTED;
+                SysFreeString(raw_name);
+                return status;
+            },
+            names);
         VariantClear(&value);
+        if (FAILED(result))
+            return result;
 
         HRESULT first_failure = S_OK;
         for (const auto& name : names) {
+            if (!predicate(name))
+                continue;
             const HRESULT removed = RemoveByName(name);
             if (FAILED(removed) && SUCCEEDED(first_failure))
                 first_failure = removed;
@@ -485,15 +525,33 @@ int RunElevatedHelper(DWORD parent_pid, std::wstring pipe_name, std::wstring ses
             case HelperOperation::shutdown_if_clean:
                 result = policy.CleanupSession(session);
                 if (SUCCEEDED(result)) {
+                    response.cleanup_confirmed = 1;
                     active_ports.clear();
                     exit_after_response = true;
                 }
                 break;
             case HelperOperation::terminate_after_cleanup:
                 result = policy.CleanupSession(session);
+                response.cleanup_confirmed = SUCCEEDED(result) ? 1U : 0U;
                 active_ports.clear();
                 exit_after_response = true;
                 break;
+            case HelperOperation::cleanup_recovery_rule: {
+                const auto end = std::find(
+                    std::begin(request.cleanup_session), std::end(request.cleanup_session), L'\0');
+                const std::wstring_view old_session(request.cleanup_session,
+                                                    end - std::begin(request.cleanup_session));
+                if (!ValidSessionId(old_session) || request.local_port == 0 ||
+                    old_session == session) {
+                    result = E_INVALIDARG;
+                } else if (!SessionDefinitelyInactive(old_session)) {
+                    result = S_FALSE; // 未确认失活，不触碰其他实例，也不确认清理。
+                } else {
+                    result = policy.Remove(old_session, request.local_port);
+                    response.cleanup_confirmed = result == S_OK ? 1U : 0U;
+                }
+                break;
+            }
             default:
                 result = E_INVALIDARG;
                 break;
@@ -542,6 +600,9 @@ bool OverlappedTransfer(HANDLE pipe, bool write, void* data, DWORD size, DWORD t
     if (!started) {
         if (WaitForSingleObject(event.get(), timeout_ms) != WAIT_OBJECT_0) {
             CancelIoEx(pipe, &overlapped);
+            // 取消是异步的；内核不再引用栈上 OVERLAPPED/请求缓冲后才能返回。
+            DWORD ignored{};
+            GetOverlappedResult(pipe, &overlapped, &ignored, TRUE);
             return false;
         }
         if (!GetOverlappedResult(pipe, &overlapped, &transferred, FALSE))
@@ -553,10 +614,16 @@ bool OverlappedTransfer(HANDLE pipe, bool write, void* data, DWORD size, DWORD t
 bool Exchange(HANDLE pipe,
               HelperOperation operation,
               std::uint16_t port,
-              HelperResponse& response) {
+              HelperResponse& response,
+              std::wstring_view cleanup_session = {}) {
     HelperRequest request;
     request.operation = operation;
     request.local_port = port;
+    if (!cleanup_session.empty()) {
+        if (!ValidSessionId(cleanup_session))
+            return false;
+        std::copy(cleanup_session.begin(), cleanup_session.end(), request.cleanup_session);
+    }
     if (!OverlappedTransfer(pipe, true, &request, sizeof(request), kIpcTimeoutMs)) {
         return false;
     }
@@ -594,6 +661,8 @@ bool ConnectPipe(HANDLE pipe, HANDLE process, std::stop_token stop) {
             break;
     }
     CancelIoEx(pipe, &overlapped);
+    DWORD ignored{};
+    GetOverlappedResult(pipe, &overlapped, &ignored, TRUE);
     return false;
 }
 
@@ -608,6 +677,11 @@ struct FirewallHelperClient::Impl {
     std::shared_ptr<ssh::IUiDispatcher> dispatcher;
     StateCallback state_callback;
     RuleCallback rule_callback;
+    RecoveryProvider recovery_provider;
+    CleanupCallback cleanup_callback;
+    std::vector<FirewallRuleIdentity> recovery_rules;
+    std::vector<FirewallRuleIdentity> confirmed_cleanups;
+    bool cleanup_notification_pending{};
     mutable std::mutex mutex;
     std::condition_variable changed;
     std::deque<Task> tasks;
@@ -615,6 +689,25 @@ struct FirewallHelperClient::Impl {
     std::string last_session;
     bool cleanup_succeeded{true};
     std::jthread worker;
+
+    void ConfirmCleanup(const HelperResponse& response, std::vector<FirewallRuleIdentity> rules) {
+        if (response.result != S_OK || response.cleanup_confirmed != 1 || rules.empty())
+            return;
+        std::erase_if(rules, [](const auto& rule) {
+            return rule.local_port == 0 ||
+                   !ValidSessionId(std::wstring(rule.session_id.begin(), rule.session_id.end()));
+        });
+        if (rules.empty())
+            return;
+        bool notify{};
+        {
+            std::scoped_lock lock(mutex);
+            confirmed_cleanups.insert(confirmed_cleanups.end(), rules.begin(), rules.end());
+            notify = !std::exchange(cleanup_notification_pending, true);
+        }
+        if (notify && dispatcher && cleanup_callback)
+            dispatcher->post(cleanup_callback);
+    }
 
     void PostState(FirewallHelperState state, std::wstring message = {}) {
         std::string session;
@@ -723,7 +816,39 @@ struct FirewallHelperClient::Impl {
         }
         PostState(FirewallHelperState::running);
 
+        // 初始化的“运行中”只代表辅助进程可用。恢复记录逐项请求确认；已不存在也可
+        // 确认，而其他活跃实例或失败项必须保留。每条请求固定大小，不发送任意规则名。
+        for (const auto& rule : recovery_rules) {
+            if (stop.stop_requested())
+                break;
+            {
+                std::scoped_lock lock(mutex);
+                if (std::ranges::any_of(tasks, [](const auto& task) {
+                        return task.operation == HelperOperation::shutdown_if_clean ||
+                               task.operation == HelperOperation::terminate_after_cleanup;
+                    }))
+                    break;
+            }
+            const std::wstring old_session(rule.session_id.begin(), rule.session_id.end());
+            if (!ValidSessionId(old_session) || rule.local_port == 0)
+                continue;
+            HelperResponse response;
+            if (!Exchange(pipe.get(),
+                          HelperOperation::cleanup_recovery_rule,
+                          rule.local_port,
+                          response,
+                          old_session)) {
+                PostState(FirewallHelperState::error,
+                          L"管理员辅助进程通信已中断；未确认的恢复记录已保留。");
+                return;
+            }
+            ConfirmCleanup(response, {rule});
+            if (FAILED(response.result))
+                PostState(FirewallHelperState::running, response.message);
+        }
+
         bool done = false;
+        std::set<std::uint16_t> session_ports;
         while (!done) {
             Task task;
             {
@@ -747,9 +872,13 @@ struct FirewallHelperClient::Impl {
             const std::wstring message = response.message;
             switch (task.operation) {
             case HelperOperation::add_rule:
+                if (succeeded)
+                    session_ports.insert(task.port);
                 PostRule(task.port, succeeded, succeeded, message);
                 break;
             case HelperOperation::remove_rule:
+                if (succeeded)
+                    session_ports.erase(task.port);
                 PostRule(task.port, false, succeeded, message);
                 break;
             case HelperOperation::shutdown_if_clean:
@@ -774,6 +903,17 @@ struct FirewallHelperClient::Impl {
             default:
                 break;
             }
+            if (task.operation == HelperOperation::shutdown_if_clean ||
+                task.operation == HelperOperation::terminate_after_cleanup) {
+                std::vector<FirewallRuleIdentity> cleaned;
+                std::string id;
+                id.reserve(session.size());
+                for (const auto ch : session)
+                    id.push_back(static_cast<char>(ch)); // 会话名已限定为 ASCII 十六进制。
+                for (auto port : session_ports)
+                    cleaned.push_back({id, port});
+                ConfirmCleanup(response, std::move(cleaned));
+            }
         }
         DisconnectNamedPipe(pipe.get());
         if (process)
@@ -790,11 +930,9 @@ struct FirewallHelperClient::Impl {
 
     bool Shutdown() noexcept {
         bool joinable{};
-        FirewallHelperState state_snapshot{FirewallHelperState::off};
         {
             std::scoped_lock lock(mutex);
             joinable = worker.joinable();
-            state_snapshot = current_state;
             if (joinable && (current_state == FirewallHelperState::running ||
                              current_state == FirewallHelperState::stopping)) {
                 tasks.push_front({HelperOperation::terminate_after_cleanup, 0});
@@ -803,8 +941,7 @@ struct FirewallHelperClient::Impl {
         if (!joinable)
             return cleanup_succeeded;
         changed.notify_one();
-        if (state_snapshot == FirewallHelperState::starting)
-            worker.request_stop();
+        worker.request_stop();
         worker.join();
         std::scoped_lock lock(mutex);
         tasks.clear();
@@ -815,11 +952,15 @@ struct FirewallHelperClient::Impl {
 
 FirewallHelperClient::FirewallHelperClient(std::shared_ptr<ssh::IUiDispatcher> dispatcher,
                                            StateCallback state_callback,
-                                           RuleCallback rule_callback)
+                                           RuleCallback rule_callback,
+                                           RecoveryProvider recovery_provider,
+                                           CleanupCallback cleanup_callback)
     : impl_(std::make_unique<Impl>()) {
     impl_->dispatcher = std::move(dispatcher);
     impl_->state_callback = std::move(state_callback);
     impl_->rule_callback = std::move(rule_callback);
+    impl_->recovery_provider = std::move(recovery_provider);
+    impl_->cleanup_callback = std::move(cleanup_callback);
 }
 
 FirewallHelperClient::~FirewallHelperClient() {
@@ -834,9 +975,13 @@ void FirewallHelperClient::SetEnabled(bool enabled) {
         }
         if (impl_->worker.joinable())
             impl_->worker.join();
+        // 仓储只在发起操作的 UI 线程读取，工作线程使用非敏感的身份快照。
+        auto recovery = impl_->recovery_provider ? impl_->recovery_provider()
+                                                 : std::vector<FirewallRuleIdentity>{};
         {
             std::scoped_lock lock(impl_->mutex);
             impl_->tasks.clear();
+            impl_->recovery_rules = std::move(recovery);
             impl_->current_state = FirewallHelperState::starting;
         }
         impl_->PostState(FirewallHelperState::starting);
@@ -864,6 +1009,12 @@ FirewallHelperState FirewallHelperClient::state() const noexcept {
 
 bool FirewallHelperClient::Shutdown() noexcept {
     return !impl_ || impl_->Shutdown();
+}
+
+std::vector<FirewallRuleIdentity> FirewallHelperClient::TakeConfirmedCleanups() {
+    std::scoped_lock lock(impl_->mutex);
+    impl_->cleanup_notification_pending = false;
+    return std::exchange(impl_->confirmed_cleanups, {});
 }
 
 std::optional<int> RunFirewallHelperIfRequested() {

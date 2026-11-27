@@ -1817,17 +1817,32 @@ struct Application::Impl {
         return std::string(bind_address) + ":" + std::to_string(local_port);
     }
 
-    void
-    RemovePersistedFirewallRules(const std::optional<std::string_view> session = std::nullopt) {
-        if (!repository)
+    void ApplyConfirmedFirewallCleanups(std::vector<FirewallRuleIdentity> confirmed) {
+        if (!repository || confirmed.empty())
             return;
-        auto rules = repository->ListFirewallRules();
-        if (!rules)
+        for (const auto& rule : confirmed) {
+            const auto removed = repository->RemoveFirewallRule(rule.session_id, rule.local_port);
+            if (!removed)
+                ShowPortForwardStorageError(L"无法删除已确认清理的防火墙恢复记录。", removed);
+        }
+        // 旧会话的清理回执不能关闭同端口的新会话开关；仍有恢复记录时保持原状态。
+        const auto remaining = repository->ListFirewallRules();
+        if (!remaining)
             return;
-        for (const auto& rule : rules.value()) {
-            if (!session || rule.session_id == *session) {
-                (void)repository->RemoveFirewallRule(rule.session_id, rule.local_port);
-            }
+        for (const auto& rule : confirmed) {
+            if (std::ranges::any_of(remaining.value(), [&](const auto& pending) {
+                    return pending.local_port == rule.local_port;
+                }))
+                continue;
+            const auto found =
+                port_forward_records.find(PortForwardIdentity("0.0.0.0", rule.local_port));
+            if (found == port_forward_records.end())
+                continue;
+            found->second.firewall_enabled = false;
+            (void)repository->UpsertPortForward(found->second);
+            if (main_window)
+                main_window->port_forward_page().SetFirewallRuleState(
+                    "0.0.0.0", rule.local_port, false, true);
         }
     }
 
@@ -2049,12 +2064,9 @@ struct Application::Impl {
             port_forwards.reset();
         }
         if (firewall_helper) {
-            const auto helper_state = firewall_helper->state();
-            const bool cleaned = firewall_helper->Shutdown();
-            if (cleaned && (helper_state == FirewallHelperState::running ||
-                            helper_state == FirewallHelperState::stopping)) {
-                RemovePersistedFirewallRules();
-            }
+            (void)firewall_helper->Shutdown();
+            // 退出时 UI 队列可能不再分发；同步领取同一批明确回执，绝不按状态清空记录。
+            ApplyConfirmedFirewallCleanups(firewall_helper->TakeConfirmedCleanups());
             firewall_helper.reset();
         }
         ResetPersistedFirewallFlags();
@@ -2290,20 +2302,7 @@ int Application::Run(HINSTANCE instance, int show_command) {
                 ui_state = ui::FirewallHelperUiState::error;
                 break;
             }
-            if (update.state == FirewallHelperState::running) {
-                // 辅助进程初始化时已删除所有陈旧 SLink 会话规则。只有收到成功状态后，
-                // 才能丢弃用于异常恢复清理的持久化记录。
-                application_state->RemovePersistedFirewallRules();
-                application_state->ResetPersistedFirewallFlags();
-                for (const auto& [identity, record] : application_state->port_forward_records) {
-                    (void)identity;
-                    application_state->main_window->port_forward_page().SetFirewallRuleState(
-                        record.bind_address, record.local_port, false, true);
-                }
-            } else if (update.state == FirewallHelperState::off && !update.session_id.empty()) {
-                application_state->RemovePersistedFirewallRules(update.session_id);
-                application_state->ResetPersistedFirewallFlags();
-            }
+            // running/off 只描述辅助进程，不证明任何规则已删除。
             application_state->main_window->port_forward_page().SetFirewallHelperState(
                 ui_state, std::move(update.message));
         },
@@ -2334,6 +2333,19 @@ int Application::Run(HINSTANCE instance, int show_command) {
                     update.succeeded,
                     std::move(update.message));
             }
+        },
+        [application_state] {
+            std::vector<FirewallRuleIdentity> pending;
+            const auto rules = application_state->repository->ListFirewallRules();
+            if (rules)
+                for (const auto& rule : rules.value())
+                    pending.push_back({rule.session_id, rule.local_port});
+            return pending;
+        },
+        [application_state] {
+            if (application_state->firewall_helper)
+                application_state->ApplyConfirmedFirewallCleanups(
+                    application_state->firewall_helper->TakeConfirmedCleanups());
         });
     port_forward_page.SetFirewallHelperRequestedCallback([application_state](bool enabled) {
         if (application_state->firewall_helper)
